@@ -363,10 +363,13 @@ def download_file(cfg: dict, repo: str, path: str, dest: Path,
                                "Ideogram 4 licence on the model page, then add "
                                "a token on the Models page.")
         r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0)) + have
         mode = "ab" if (have and r.status_code == 206) else "wb"
         if mode == "wb":
-            have = 0
+            have = 0          # the server ignored Range — starting over
+        # Work out the size after that reset: on a 206 Content-Length is what
+        # is left, on a 200 it is the whole file. Adding `have` to a restart
+        # would double-count the bytes already on disk.
+        total = int(r.headers.get("Content-Length", 0)) + have
         got, last, started = have, 0.0, time.time()
         with open(part, mode) as fh:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -382,6 +385,14 @@ def download_file(cfg: dict, repo: str, path: str, dest: Path,
                     speed = (got - have) / max(now - started, .1)
                     eta = (total - got) / speed if speed > 0 and total else 0
                     on_progress(got, total, speed, eta)
+    # A cut-off transfer just ends the iterator — no exception. Promoting a
+    # short file to the real name would leave a model that looks installed and
+    # fails to load, so stop here and keep the .part for the next resume.
+    if total and got < total:
+        raise RuntimeError(
+            f"The download stopped early — {got/1e9:.2f} of {total/1e9:.2f} GB "
+            "arrived. What came through is kept; start it again and it carries "
+            "on from there.")
     part.replace(dest)
 
 

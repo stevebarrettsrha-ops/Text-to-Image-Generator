@@ -424,6 +424,36 @@ class ComfyClient:
         except Exception:
             pass
 
+    def running_ids(self) -> list[str]:
+        """The prompt ids ComfyUI is executing right now."""
+        try:
+            r = requests.get(f"{self.url}/queue", timeout=10)
+            r.raise_for_status()
+            entries = r.json().get("queue_running") or []
+        except Exception:
+            return []
+        out = []
+        for entry in entries:
+            # [number, prompt_id, prompt, extra_data, outputs]
+            if isinstance(entry, (list, tuple)) and len(entry) > 1:
+                out.append(str(entry[1]))
+        return out
+
+    def cancel(self, prompt_id: str) -> None:
+        """Cancel one prompt without disturbing the rest of the queue.
+
+        /interrupt stops whatever is executing, which is not necessarily this
+        prompt — several jobs can be in flight at once. So drop it from the
+        queue first, and only interrupt if it is the one actually running.
+        """
+        try:
+            requests.post(f"{self.url}/queue", json={"delete": [prompt_id]},
+                          timeout=10)
+        except Exception:
+            pass
+        if prompt_id in self.running_ids():
+            self.interrupt()
+
     def history(self, prompt_id: str) -> dict:
         r = requests.get(f"{self.url}/history/{prompt_id}", timeout=20)
         r.raise_for_status()

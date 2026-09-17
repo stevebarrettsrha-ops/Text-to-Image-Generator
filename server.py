@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
-import shutil
 import threading
 import time
 import uuid
@@ -46,25 +45,44 @@ ws_progress: dict[str, dict] = {}
 # --------------------------------------------------------------------------- #
 # gallery
 # --------------------------------------------------------------------------- #
+def _read_gallery() -> list[dict]:
+    """Caller holds gallery_lock."""
+    if not GALLERY_PATH.exists():
+        return []
+    try:
+        return json.loads(GALLERY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _write_gallery(items: list[dict]) -> None:
+    """Caller holds gallery_lock. Written to one side and renamed over, so an
+    interrupted write cannot leave a half-file — a truncated gallery.json reads
+    back as empty, which would lose the whole library."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = GALLERY_PATH.with_name(GALLERY_PATH.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(items, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, GALLERY_PATH)
+
+
 def read_gallery() -> list[dict]:
     with gallery_lock:
-        if not GALLERY_PATH.exists():
-            return []
-        try:
-            return json.loads(GALLERY_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return []
+        return _read_gallery()
 
 
 def write_gallery(items: list[dict]) -> None:
     with gallery_lock:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        GALLERY_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        _write_gallery(items)
 
 
 def add_images(items: list[dict]) -> None:
-    gallery = read_gallery()
-    write_gallery(items + gallery)
+    # Read and write under one lock. Batches finish at the same moment, and
+    # releasing between the two lets one job overwrite another's images.
+    with gallery_lock:
+        _write_gallery(items + _read_gallery())
 
 
 def title_from(p: dict) -> str:
@@ -125,11 +143,14 @@ def run_job(job_id: str, params: dict) -> None:
         started = time.time()
         while True:
             time.sleep(1.0)
+            # Read the flag under the lock, then let it go: set_state() takes
+            # the same lock, and jobs_lock is not reentrant.
             with jobs_lock:
-                if jobs[job_id].get("cancelled"):
-                    client.interrupt()
-                    set_state(status="cancelled", stage="Cancelled")
-                    return
+                cancelled = bool(jobs[job_id].get("cancelled"))
+            if cancelled:
+                client.cancel(prompt_id)
+                set_state(status="cancelled", stage="Cancelled")
+                return
             err = client.failed(prompt_id)
             if err:
                 set_state(status="error", error=err, stage="Failed")
@@ -460,10 +481,12 @@ def api_jobs():
 
 @app.post("/api/jobs/<job_id>/cancel")
 def api_job_cancel(job_id: str):
+    # Just raise the flag. The job thread owns its prompt_id, so only it can
+    # cancel the right prompt — interrupting from here would stop whichever
+    # job the engine happens to be running.
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id]["cancelled"] = True
-    client.interrupt()
     return jsonify({"ok": True})
 
 
@@ -501,14 +524,17 @@ def api_image(image_id: str):
 
 @app.delete("/api/image/<image_id>")
 def api_image_delete(image_id: str):
-    items = read_gallery()
-    for item in items:
-        if item["id"] == image_id:
-            try:
-                (IMAGES_DIR / item["file"]).unlink(missing_ok=True)
-            except OSError:
-                pass
-    write_gallery([i for i in items if i["id"] != image_id])
+    with gallery_lock:
+        keep, drop = [], []
+        for item in _read_gallery():
+            (drop if item["id"] == image_id else keep).append(item)
+        if drop:
+            _write_gallery(keep)
+    for item in drop:  # unlink outside the lock, once the entry is really gone
+        try:
+            (IMAGES_DIR / item["file"]).unlink(missing_ok=True)
+        except OSError:
+            pass
     return jsonify({"ok": True})
 
 
