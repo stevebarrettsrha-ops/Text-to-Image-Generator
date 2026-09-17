@@ -14,6 +14,7 @@ import time
 import uuid
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
@@ -30,6 +31,22 @@ WEB_DIR = APP_DIR / "web"
 PORT = int(os.environ.get("IDEOGRAM_STUDIO_PORT", "7802"))
 
 app = Flask(__name__, static_folder=None)
+
+
+@app.before_request
+def block_cross_site():
+    """This API installs software, downloads weights and deletes files, and it
+    has no login — anything that can reach it can drive it. A page on any site
+    can send a 'simple' POST to 127.0.0.1 with no preflight to stop it, so
+    refuse writes that a browser tells us came from somewhere else. Requests
+    with no Origin (curl, scripts) are left alone."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    origin = request.headers.get("Origin")
+    if origin and urlparse(origin).netloc != request.host:
+        return jsonify({"error": "Refused: that request came from another "
+                                 "site."}), 403
+    return None
 
 cfg = load_config()
 progress = Progress()

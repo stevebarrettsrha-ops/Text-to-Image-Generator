@@ -1090,14 +1090,26 @@ async function loadImages() {
   catch (e) { return; }
   renderFeed(); renderLib(); renderHome();
 }
+function setSlider(id, valId, value, places) {
+  if (value === null || value === undefined || value === "") return;
+  $(id).value = value;
+  $(valId).textContent = places ? Number(value).toFixed(places) : String(value);
+}
+function pickOption(sel, value) {
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === value) { sel.value = value; return true; }
+  }
+  return false;   // the engine no longer offers it — leave the current choice
+}
 function reuse(im) {
   FIELDS.forEach(function (f) { if (im[f] != null) $(f).value = im[f]; });
   S.regions = (im.regions || []).slice();
-  if (im.steps) { $("steps-sl").value = im.steps; $("stepsVal").textContent = im.steps; }
-  if (im.guider_cfg) { $("guider-sl").value = im.guider_cfg;
-    $("guiderVal").textContent = Number(im.guider_cfg).toFixed(1); }
-  if (im.shift) { $("shift-sl").value = im.shift;
-    $("shiftVal").textContent = Number(im.shift).toFixed(1); }
+  setSlider("steps-sl", "stepsVal", im.steps, 0);
+  setSlider("guider-sl", "guiderVal", im.guider_cfg, 1);
+  setSlider("cfg-sl", "cfgVal", im.cfg, 1);
+  setSlider("shift-sl", "shiftVal", im.shift, 1);
+  if (im.sampler) pickOption($("sampler-sel"), im.sampler);
+  if (im.scheduler) pickOption($("sched-sel"), im.scheduler);
   if (im.width && im.height) {
     var best = "1:1", bestDiff = 9;
     Object.keys(RATIOS).forEach(function (k) {
@@ -1105,16 +1117,35 @@ function reuse(im) {
       if (diff < bestDiff) { bestDiff = diff; best = k; }
     });
     S.ratio = best;
+    // The ratio alone does not fix the size — without the megapixels the
+    // reused settings come back at whatever size the sliders happen to hold.
+    var mp = Math.round((im.width * im.height / 1048576) * 10) / 10;
+    S.mp = Math.max(0.5, Math.min(2, mp));
+    $("mp-sl").value = S.mp;
     $("segRatio").querySelectorAll("button").forEach(function (b) {
       b.classList.toggle("on", b.dataset.v === best); });
   }
+  // Switch on exactly the LoRAs this image used, at the strengths it used.
+  var have = {};
+  S.loras.forEach(function (l) { have[l.name] = true; });
+  Object.keys(S.loraPick).forEach(function (k) { S.loraPick[k].on = false; });
+  var gone = [];
+  (im.loras || []).forEach(function (l) {
+    if (!l || !l.name) return;
+    if (have[l.name]) S.loraPick[l.name] = { on: true,
+      strength: Number(l.strength) || 0.6 };
+    else gone.push(l.name.replace(/\.safetensors$/, ""));
+  });
+  renderLoraPick();
   S.sel = -1;
   $("regEditor").hidden = true;
   $("lightbox").hidden = true;
   show("create");
   syncSize(); renderRegions(); saveDraft();
   if ((im.regions || []).length) $("btnLayout").classList.add("on");
-  toast("Settings loaded. The seed stays random unless you set it.");
+  toast(gone.length
+    ? "Settings loaded, but these LoRAs are no longer installed: " + gone.join(", ")
+    : "Settings loaded. The seed stays random unless you set it.", gone.length > 0);
 }
 async function removeImage(im) {
   if (!confirm("Delete this image?")) return;
@@ -1661,10 +1692,14 @@ async function refreshStatus() {
       + "prompt as text instead of being placed.";
   }
   var c = st.config || {};
-  $("cfg-url").value = c.comfy_url || "";
-  $("cfg-dir").value = c.comfy_dir || "";
-  $("cfg-models").value = c.models_dir || "";
-  $("cfg-auto").checked = !!c.auto_start_comfy;
+  // This runs every 6 seconds. Refill the settings fields only while the sheet
+  // is closed — writing to an input someone is typing into wipes their edit.
+  if ($("veil-settings").hidden) {
+    $("cfg-url").value = c.comfy_url || "";
+    $("cfg-dir").value = c.comfy_dir || "";
+    $("cfg-models").value = c.models_dir || "";
+    $("cfg-auto").checked = !!c.auto_start_comfy;
+  }
   $("cfg-note").textContent = st.schema_error || "";
   if (!st.setup_complete && !S.setupSeen) { S.setupSeen = true; openSetup(); }
 }

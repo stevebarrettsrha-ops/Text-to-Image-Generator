@@ -31,6 +31,8 @@ import uuid
 import requests
 
 PROMPT_BUILDER = "Ideogram4PromptBuilderKJ"
+# From the DeverStyle model card, not a guess.
+LORA_DEFAULT_STRENGTH = 0.6
 
 
 class ComfyError(RuntimeError):
@@ -142,6 +144,17 @@ class ComfyClient:
                 return n
         return ""
 
+    # Longest first, so nvfp4 is not read as fp4.
+    PRECISION_TAGS = ("nvfp4", "int8", "int4", "fp16", "bf16", "fp8", "fp4")
+
+    @classmethod
+    def _precision(cls, name: str) -> str:
+        low = name.lower()
+        for tag in cls.PRECISION_TAGS:
+            if tag in low:
+                return tag
+        return ""
+
     def resolve_models(self, p: dict) -> dict:
         """Work out which files to load, preferring what the person chose."""
         unets, clips, vaes = self.unets(), self.clips(), self.vaes()
@@ -158,6 +171,21 @@ class ComfyClient:
                 "The unconditional Ideogram 4 model is missing. Ideogram 4 needs "
                 "both halves of the pair — download "
                 "ideogram4_unconditional_*.safetensors on the Models page.")
+        # The halves have to be the same precision. An fp8 conditional next to
+        # an nvfp4 unconditional loads without a murmur and generates nonsense —
+        # the same silent failure as running a single-model graph. Only judged
+        # when both names actually carry a precision tag.
+        want, got = self._precision(cond), self._precision(uncond)
+        if want and got and want != got:
+            partner = next((n for n in unets if "uncond" in n.lower()
+                            and self._precision(n) == want), "")
+            if not partner:
+                raise ComfyError(
+                    f"'{cond}' is {want} but the only unconditional model on "
+                    f"disk is {got}. Ideogram 4 needs a matched pair — download "
+                    f"the {want} unconditional half on the Models page, or "
+                    f"switch to the {got} set.")
+            uncond = partner
         clip = self._pick(clips, p.get("clip", ""), ["qwen3vl"]) or \
             (clips[0] if clips else "")
         if not clip:
@@ -326,7 +354,8 @@ class ComfyClient:
                     "lora": {"names": ["lora_name"], "value": name,
                              "required": True},
                     "strength": {"names": ["strength_model", "strength"],
-                                 "value": float(lora.get("strength", 1.0))},
+                                 "value": float(lora.get("strength",
+                                                          LORA_DEFAULT_STRENGTH))},
                 }
                 if cls == "LoraLoader":
                     wanted["clip"] = {"names": ["clip"], "value": ["3", 0]}
