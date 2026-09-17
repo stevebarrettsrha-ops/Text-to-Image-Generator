@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Ideogram Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m12 3 2 5.5L19.5 10 14 12l-2 5.5L10 12 4.5 10 10 8.5z' fill='%237c4dff'/%3E%3C/svg%3E" />
 <style>
   :root{
     --bg:#08080a; --chrome:#101014; --panel:#14141a; --raised:#1a1a21;
@@ -118,7 +119,7 @@
   .tile .over .meta{font-size:10.5px;color:#a9a9b4;margin-top:3px}
   .tile .acts{position:absolute;top:8px;right:8px;display:flex;gap:4px;opacity:0;
         transition:opacity .16s}
-  .tile:hover .acts{opacity:1}
+  .tile:hover .acts,.tile:focus-within .acts{opacity:1}
   .tile .acts button{width:28px;height:28px;border-radius:8px;background:rgba(8,8,10,.72);
         border:1px solid rgba(255,255,255,.1);color:#fff;display:grid;place-items:center}
   .tile .acts button:hover{background:rgba(8,8,10,.92)}
@@ -587,7 +588,8 @@
 </div>
 
 <!-- lightbox -->
-<div class="lightbox" id="lightbox" hidden>
+<div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true"
+     aria-labelledby="lbTitle">
   <div class="stage"><img id="lbImg" alt=""></div>
   <div class="side">
     <h3 id="lbTitle">Image</h3>
@@ -668,6 +670,7 @@
 /* ========================= state ========================= */
 var S = {
   view: "home", ratio: "3:4", mp: 1, regions: [], sel: -1,
+  engineFlags: { status: false, deps: false }, lbReturn: null,
   status: null, jobs: [], images: [], libFilter: "", batch: 1,
   setupCursor: 0, taskId: null, taskCursor: 0, setupSeen: false, lightbox: null,
   loras: [], loraPick: {}
@@ -821,6 +824,9 @@ function wireCanvas() {
     S.regions.push(region);
     S.sel = S.regions.length - 1;
     renderRegions();
+    // Move the one box being drawn. Re-rendering the whole set on every
+    // pointermove tears down and rebuilds every element under the cursor.
+    var live = cv.querySelectorAll(".box")[S.sel];
     function move(e) {
       var cx = (e.clientX - rect.left) / rect.width;
       var cy = (e.clientY - rect.top) / rect.height;
@@ -828,7 +834,12 @@ function wireCanvas() {
       region.y = round4(clamp(Math.min(sy, cy)));
       region.w = round4(Math.min(1 - region.x, Math.abs(cx - sx)));
       region.h = round4(Math.min(1 - region.y, Math.abs(cy - sy)));
-      renderRegions();
+      if (live) {
+        live.style.left = (region.x * 100) + "%";
+        live.style.top = (region.y * 100) + "%";
+        live.style.width = (region.w * 100) + "%";
+        live.style.height = (region.h * 100) + "%";
+      }
     }
     function up() {
       window.removeEventListener("pointermove", move);
@@ -991,9 +1002,9 @@ async function pollJobs() {
 function tile(im) {
   var el = document.createElement("div");
   el.className = "tile";
-  var ratio = (im.width && im.height) ? (im.height / im.width) : 1;
   el.innerHTML = '<img src="/api/image/' + im.id + '" alt="' + esc(im.title) +
-    '" style="aspect-ratio:' + (im.width || 1) + "/" + (im.height || 1) + '">' +
+    '" tabindex="0" role="button" style="aspect-ratio:' +
+    (im.width || 1) + "/" + (im.height || 1) + '">' +
     '<div class="acts">' +
     '<button data-act="reuse" title="Reuse settings"><svg viewBox="0 0 24 24">' +
     '<path d="M4 9a8 8 0 0 1 14-4M20 15a8 8 0 0 1-14 4"/><path d="M18 4v5h-5M6 20v-5h5"/></svg></button>' +
@@ -1004,8 +1015,11 @@ function tile(im) {
     '<div class="over"><div class="cap">' + esc(im.description || im.title) + "</div>" +
     '<div class="meta">' + (im.width || "?") + "×" + (im.height || "?") +
     " · seed " + im.seed + "</div></div>";
-  void ratio;
-  el.querySelector("img").addEventListener("click", function () { openLightbox(im); });
+  var shot = el.querySelector("img");
+  shot.addEventListener("click", function () { openLightbox(im); });
+  shot.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openLightbox(im); }
+  });
   el.querySelector(".over").addEventListener("click", function () { openLightbox(im); });
   el.querySelectorAll("[data-act]").forEach(function (b) {
     b.addEventListener("click", function (ev) {
@@ -1139,7 +1153,7 @@ function reuse(im) {
   renderLoraPick();
   S.sel = -1;
   $("regEditor").hidden = true;
-  $("lightbox").hidden = true;
+  closeLightbox();
   show("create");
   syncSize(); renderRegions(); saveDraft();
   if ((im.regions || []).length) $("btnLayout").classList.add("on");
@@ -1150,12 +1164,20 @@ function reuse(im) {
 async function removeImage(im) {
   if (!confirm("Delete this image?")) return;
   await api("/api/image/" + im.id, { method: "DELETE" });
-  if (S.lightbox && S.lightbox.id === im.id) $("lightbox").hidden = true;
+  if (S.lightbox && S.lightbox.id === im.id) closeLightbox();
   loadImages();
+}
+function closeLightbox() {
+  $("lightbox").hidden = true;
+  var back = S.lbReturn;
+  S.lbReturn = null;
+  if (back && document.contains(back)) back.focus();
 }
 function openLightbox(im) {
   S.lightbox = im;
+  S.lbReturn = document.activeElement;   // put focus back where it came from
   $("lbImg").src = "/api/image/" + im.id;
+  $("lbImg").alt = im.title || "Generated image";
   $("lbTitle").textContent = im.title;
   $("lbPrompt").textContent = im.description || "(no description)";
   var rows = [["Size", (im.width || "?") + " × " + (im.height || "?")],
@@ -1172,6 +1194,7 @@ function openLightbox(im) {
     return '<div class="kv"><span>' + esc(r[0]) + "</span><b>" + esc(r[1]) + "</b></div>";
   }).join("");
   $("lightbox").hidden = false;
+  $("lbClose").focus();
 }
 
 /* ========================= loras ========================= */
@@ -1301,10 +1324,18 @@ async function loadDeps() {
       }
       box.appendChild(el);
     });
-    $("engineTag").hidden = bad === 0;
+    setEngineTag("deps", bad > 0);
   } catch (e) {
     box.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
   }
+}
+// Two things know whether the Engine page needs attention: the status poll
+// (engine up? nodes loaded?) and the Engine page's own scan (git, torch, …).
+// They used to overwrite each other, so keep both answers and show the badge
+// if either is unhappy.
+function setEngineTag(source, needsAttention) {
+  S.engineFlags[source] = !!needsAttention;
+  $("engineTag").hidden = !(S.engineFlags.status || S.engineFlags.deps);
 }
 function mkBtn(label, fn) {
   var b = document.createElement("button");
@@ -1673,7 +1704,7 @@ async function refreshStatus() {
     : !st.nodes_ready ? "Nodes not loaded"
     : st.missing_models.length ? "Weights missing" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
-  $("engineTag").hidden = !!(st.comfy_online && st.nodes_ready);
+  setEngineTag("status", !(st.comfy_online && st.nodes_ready));
   $("genLabel").textContent = st.ready ? "Generate" : "Set up";
   if (st.samplers) fill($("sampler-sel"), st.samplers, "euler");
   if (st.schedulers) fill($("sched-sel"), st.schedulers, "simple");
@@ -1764,12 +1795,15 @@ function wire() {
     closePops(); show("models"); });
   $("btnCloseSettings").addEventListener("click", closePops);
   $("btnCloseLayout").addEventListener("click", closePops);
+  // Each popover and the button that toggles it. A click inside either is
+  // the popover's own business; anything else closes it.
+  var POPS = { settingsPop: "btnSettings", layoutPop: "btnLayout",
+               loraPop: "btnLoras" };
   document.addEventListener("pointerdown", function (e) {
-    ["settingsPop", "layoutPop"].forEach(function (id) {
+    Object.keys(POPS).forEach(function (id) {
       var pop = $(id);
-      if (pop.hidden) return;
-      if (pop.contains(e.target)) return;
-      if ($("btnSettings").contains(e.target) || $("btnLayout").contains(e.target)) return;
+      if (pop.hidden || pop.contains(e.target)) return;
+      if ($(POPS[id]).contains(e.target)) return;
       pop.hidden = true;
     });
   });
@@ -1827,7 +1861,7 @@ function wire() {
   $("libSearch").addEventListener("input", function (e) {
     S.libFilter = e.target.value; renderLib(); });
 
-  $("lbClose").addEventListener("click", function () { $("lightbox").hidden = true; });
+  $("lbClose").addEventListener("click", closeLightbox);
   $("lbReuse").addEventListener("click", function () {
     if (S.lightbox) reuse(S.lightbox); });
   $("lbDownload").addEventListener("click", function () {
@@ -1838,7 +1872,7 @@ function wire() {
     if (!S.lightbox) return;
     reuse(S.lightbox);
     $("seed").value = "";
-    $("lightbox").hidden = true;
+    closeLightbox();
     generate();
   });
 
@@ -1905,7 +1939,7 @@ function wire() {
   document.addEventListener("keydown", function (e) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); generate(); }
     if (e.key === "Escape") {
-      if (!$("lightbox").hidden) { $("lightbox").hidden = true; return; }
+      if (!$("lightbox").hidden) { closeLightbox(); return; }
       closePops();
       $("veil-settings").hidden = true;
       if ($("setup-progress").hidden) $("veil-setup").hidden = true;

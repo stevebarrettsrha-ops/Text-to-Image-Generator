@@ -53,10 +53,28 @@ progress = Progress()
 comfy_proc = ComfyProcess()
 client = ComfyClient(cfg["comfy_url"])
 
+JOB_TTL = 1800          # finished jobs stay visible this long, then go
+MAX_JOBS = 200
+
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 gallery_lock = threading.Lock()
 ws_progress: dict[str, dict] = {}
+
+
+def prune_jobs() -> None:
+    """Caller holds jobs_lock. Finished jobs linger so the feed can show the
+    last result, then are dropped — otherwise the dict grows for the life of
+    the process. Running jobs are never touched."""
+    now = time.time()
+    for job in [j for j in jobs.values()
+                if j["status"] != "running" and now - j["created"] > JOB_TTL]:
+        jobs.pop(job["id"], None)
+    if len(jobs) > MAX_JOBS:
+        done = sorted((j for j in jobs.values() if j["status"] != "running"),
+                      key=lambda j: j["created"])
+        for job in done[:len(jobs) - MAX_JOBS]:
+            jobs.pop(job["id"], None)
 
 
 # --------------------------------------------------------------------------- #
@@ -146,9 +164,12 @@ def ws_listener() -> None:
 # generation job
 # --------------------------------------------------------------------------- #
 def run_job(job_id: str, params: dict) -> None:
+    prompt_id = ""
+
     def set_state(**kw):
         with jobs_lock:
-            jobs[job_id].update(kw)
+            if job_id in jobs:      # it may have aged out of the list
+                jobs[job_id].update(kw)
 
     try:
         set_state(stage="Building the graph", pct=2)
@@ -230,6 +251,11 @@ def run_job(job_id: str, params: dict) -> None:
     except Exception as exc:  # noqa: BLE001
         set_state(status="error", error=f"{type(exc).__name__}: {exc}",
                   stage="Failed")
+    finally:
+        # The websocket drops its entry on execution_success, but a run that
+        # errors or is interrupted may never send one.
+        if prompt_id:
+            ws_progress.pop(prompt_id, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -478,6 +504,7 @@ def api_generate():
     for _ in range(runs):
         job_id = uuid.uuid4().hex[:12]
         with jobs_lock:
+            prune_jobs()
             jobs[job_id] = {"id": job_id, "status": "running", "pct": 0,
                             "stage": "Starting", "created": time.time(),
                             "title": params.get("title") or title_from(params)}
@@ -491,6 +518,7 @@ def api_generate():
 @app.get("/api/jobs")
 def api_jobs():
     with jobs_lock:
+        prune_jobs()
         active = [j for j in jobs.values()
                   if j["status"] == "running" or time.time() - j["created"] < 180]
         return jsonify(sorted(active, key=lambda j: j["created"], reverse=True))
