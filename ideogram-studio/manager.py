@@ -473,7 +473,7 @@ def delete_model(cfg: dict, folder: str, name: str) -> None:
         raise RuntimeError("That path is not allowed.")
     root = Path(cfg["models_dir"]).resolve()
     target = (root / folder / name).resolve()
-    if not str(target).startswith(str(root)):
+    if not target.is_relative_to(root):
         raise RuntimeError("That path is outside the models folder.")
     if not target.exists():
         raise RuntimeError("That file is already gone.")
@@ -497,9 +497,16 @@ def loras_installed(cfg: dict) -> list[dict]:
 def delete_lora(cfg: dict, name: str) -> None:
     if not cfg.get("models_dir"):
         raise RuntimeError("No models folder is set.")
+    # LoRA names may carry a subfolder, so a plain separator ban is too strict —
+    # but ".." and absolute paths never belong in one.
+    parts = Path(name).parts
+    if not name or not parts or ".." in parts or Path(name).is_absolute():
+        raise RuntimeError("That path is not allowed.")
     root = (Path(cfg["models_dir"]) / "loras").resolve()
     target = (root / name).resolve()
-    if not str(target).startswith(str(root)):
+    # A prefix test would accept a sibling folder whose name merely starts with
+    # "loras"; is_relative_to compares path components.
+    if not target.is_relative_to(root):
         raise RuntimeError("That path is outside the LoRA folder.")
     if not target.exists():
         raise RuntimeError("That file is already gone.")

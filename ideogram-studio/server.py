@@ -9,12 +9,12 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
-import shutil
 import threading
 import time
 import uuid
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
@@ -32,10 +32,29 @@ PORT = int(os.environ.get("IDEOGRAM_STUDIO_PORT", "7802"))
 
 app = Flask(__name__, static_folder=None)
 
+
+@app.before_request
+def block_cross_site():
+    """This API installs software, downloads weights and deletes files, and it
+    has no login — anything that can reach it can drive it. A page on any site
+    can send a 'simple' POST to 127.0.0.1 with no preflight to stop it, so
+    refuse writes that a browser tells us came from somewhere else. Requests
+    with no Origin (curl, scripts) are left alone."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    origin = request.headers.get("Origin")
+    if origin and urlparse(origin).netloc != request.host:
+        return jsonify({"error": "Refused: that request came from another "
+                                 "site."}), 403
+    return None
+
 cfg = load_config()
 progress = Progress()
 comfy_proc = ComfyProcess()
 client = ComfyClient(cfg["comfy_url"])
+
+JOB_TTL = 1800          # finished jobs stay visible this long, then go
+MAX_JOBS = 200
 
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
@@ -43,28 +62,62 @@ gallery_lock = threading.Lock()
 ws_progress: dict[str, dict] = {}
 
 
+def prune_jobs() -> None:
+    """Caller holds jobs_lock. Finished jobs linger so the feed can show the
+    last result, then are dropped — otherwise the dict grows for the life of
+    the process. Running jobs are never touched."""
+    now = time.time()
+    for job in [j for j in jobs.values()
+                if j["status"] != "running" and now - j["created"] > JOB_TTL]:
+        jobs.pop(job["id"], None)
+    if len(jobs) > MAX_JOBS:
+        done = sorted((j for j in jobs.values() if j["status"] != "running"),
+                      key=lambda j: j["created"])
+        for job in done[:len(jobs) - MAX_JOBS]:
+            jobs.pop(job["id"], None)
+
+
 # --------------------------------------------------------------------------- #
 # gallery
 # --------------------------------------------------------------------------- #
+def _read_gallery() -> list[dict]:
+    """Caller holds gallery_lock."""
+    if not GALLERY_PATH.exists():
+        return []
+    try:
+        return json.loads(GALLERY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _write_gallery(items: list[dict]) -> None:
+    """Caller holds gallery_lock. Written to one side and renamed over, so an
+    interrupted write cannot leave a half-file — a truncated gallery.json reads
+    back as empty, which would lose the whole library."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = GALLERY_PATH.with_name(GALLERY_PATH.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(items, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, GALLERY_PATH)
+
+
 def read_gallery() -> list[dict]:
     with gallery_lock:
-        if not GALLERY_PATH.exists():
-            return []
-        try:
-            return json.loads(GALLERY_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return []
+        return _read_gallery()
 
 
 def write_gallery(items: list[dict]) -> None:
     with gallery_lock:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        GALLERY_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        _write_gallery(items)
 
 
 def add_images(items: list[dict]) -> None:
-    gallery = read_gallery()
-    write_gallery(items + gallery)
+    # Read and write under one lock. Batches finish at the same moment, and
+    # releasing between the two lets one job overwrite another's images.
+    with gallery_lock:
+        _write_gallery(items + _read_gallery())
 
 
 def title_from(p: dict) -> str:
@@ -111,9 +164,12 @@ def ws_listener() -> None:
 # generation job
 # --------------------------------------------------------------------------- #
 def run_job(job_id: str, params: dict) -> None:
+    prompt_id = ""
+
     def set_state(**kw):
         with jobs_lock:
-            jobs[job_id].update(kw)
+            if job_id in jobs:      # it may have aged out of the list
+                jobs[job_id].update(kw)
 
     try:
         set_state(stage="Building the graph", pct=2)
@@ -125,11 +181,14 @@ def run_job(job_id: str, params: dict) -> None:
         started = time.time()
         while True:
             time.sleep(1.0)
+            # Read the flag under the lock, then let it go: set_state() takes
+            # the same lock, and jobs_lock is not reentrant.
             with jobs_lock:
-                if jobs[job_id].get("cancelled"):
-                    client.interrupt()
-                    set_state(status="cancelled", stage="Cancelled")
-                    return
+                cancelled = bool(jobs[job_id].get("cancelled"))
+            if cancelled:
+                client.cancel(prompt_id)
+                set_state(status="cancelled", stage="Cancelled")
+                return
             err = client.failed(prompt_id)
             if err:
                 set_state(status="error", error=err, stage="Failed")
@@ -192,6 +251,11 @@ def run_job(job_id: str, params: dict) -> None:
     except Exception as exc:  # noqa: BLE001
         set_state(status="error", error=f"{type(exc).__name__}: {exc}",
                   stage="Failed")
+    finally:
+        # The websocket drops its entry on execution_success, but a run that
+        # errors or is interrupted may never send one.
+        if prompt_id:
+            ws_progress.pop(prompt_id, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -440,6 +504,7 @@ def api_generate():
     for _ in range(runs):
         job_id = uuid.uuid4().hex[:12]
         with jobs_lock:
+            prune_jobs()
             jobs[job_id] = {"id": job_id, "status": "running", "pct": 0,
                             "stage": "Starting", "created": time.time(),
                             "title": params.get("title") or title_from(params)}
@@ -453,6 +518,7 @@ def api_generate():
 @app.get("/api/jobs")
 def api_jobs():
     with jobs_lock:
+        prune_jobs()
         active = [j for j in jobs.values()
                   if j["status"] == "running" or time.time() - j["created"] < 180]
         return jsonify(sorted(active, key=lambda j: j["created"], reverse=True))
@@ -460,10 +526,12 @@ def api_jobs():
 
 @app.post("/api/jobs/<job_id>/cancel")
 def api_job_cancel(job_id: str):
+    # Just raise the flag. The job thread owns its prompt_id, so only it can
+    # cancel the right prompt — interrupting from here would stop whichever
+    # job the engine happens to be running.
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id]["cancelled"] = True
-    client.interrupt()
     return jsonify({"ok": True})
 
 
@@ -501,14 +569,17 @@ def api_image(image_id: str):
 
 @app.delete("/api/image/<image_id>")
 def api_image_delete(image_id: str):
-    items = read_gallery()
-    for item in items:
-        if item["id"] == image_id:
-            try:
-                (IMAGES_DIR / item["file"]).unlink(missing_ok=True)
-            except OSError:
-                pass
-    write_gallery([i for i in items if i["id"] != image_id])
+    with gallery_lock:
+        keep, drop = [], []
+        for item in _read_gallery():
+            (drop if item["id"] == image_id else keep).append(item)
+        if drop:
+            _write_gallery(keep)
+    for item in drop:  # unlink outside the lock, once the entry is really gone
+        try:
+            (IMAGES_DIR / item["file"]).unlink(missing_ok=True)
+        except OSError:
+            pass
     return jsonify({"ok": True})
 
 
