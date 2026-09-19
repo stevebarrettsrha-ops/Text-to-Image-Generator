@@ -71,6 +71,13 @@
   .statuspill i{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none}
   .statuspill.on i{background:var(--ok);box-shadow:0 0 0 3px rgba(61,220,151,.16)}
   .statuspill.off i{background:var(--err);box-shadow:0 0 0 3px rgba(255,90,90,.14)}
+  .statuspill.starting i{background:var(--warn);box-shadow:0 0 0 3px rgba(255,176,32,.15);
+        animation:blink 1.2s ease-in-out infinite}
+  @keyframes blink{50%{opacity:.35}}
+  .btn .spin{display:inline-block;width:11px;height:11px;border:2px solid currentColor;
+        border-right-color:transparent;border-radius:50%;margin-right:7px;
+        vertical-align:-1px;animation:rot .8s linear infinite}
+  @keyframes rot{to{transform:rotate(360deg)}}
 
   /* ---------- prompt bar: the hero ---------- */
   .barwrap{position:sticky;top:0;z-index:20;padding:18px 26px 12px;
@@ -1057,12 +1064,17 @@ function skeleton(job) {
   var el = document.createElement("div");
   el.className = "skel" + (job.status === "error" ? " bad" : "");
   var pct = Math.round(job.pct || 0);
+  // vague means the number is a guess (the engine is loading weights, with no
+  // step count yet), so show a moving bar and no percentage rather than a bar
+  // frozen at 12% — which reads as "hung".
+  var vague = !!job.vague && job.status !== "error";
   el.innerHTML = '<div class="ph" style="aspect-ratio:' + d.w + "/" + d.h + '"></div>' +
     '<div class="lbl"><span>' + esc(job.status === "error"
       ? (job.error || "Failed") : (job.stage || "Working…")) + "</span><span>" +
-    (job.status === "error" ? "" : pct + "%") + "</span></div>" +
+    (job.status === "error" || vague ? "" : pct + "%") + "</span></div>" +
     (job.status === "error" ? "" :
-      '<div class="bar4"><i style="width:' + pct + '%"></i></div>');
+      vague ? '<div class="bar4 indet"><i></i></div>'
+            : '<div class="bar4"><i style="width:' + pct + '%"></i></div>');
   if (job.status === "running") {
     var b = document.createElement("button");
     b.className = "btn thin";
@@ -1318,6 +1330,10 @@ function syncLoraLabel() {
 /* ========================= engine page ========================= */
 async function loadDeps() {
   var box = $("dep-list");
+  if (!box.querySelector(".fitem")) {
+    box.innerHTML = '<div class="empty">Checking what is installed — this '
+      + 'probes Python, Git and PyTorch, so it can take a few seconds…</div>';
+  }
   try {
     var d = await api("/api/deps");
     $("torch-index").value = d.torch_index || "";
@@ -1412,10 +1428,85 @@ async function installAllMissing() {
     toast("All set. Restart ComfyUI so it loads the nodes.");
   } catch (e) { toast(e.message, true); }
 }
-async function startEngine() {
+function busy(btn, label) {
+  var old = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>' + esc(label);
+  return {
+    label: function (text) { btn.innerHTML = '<span class="spin"></span>' + esc(text); },
+    done: function () { btn.disabled = false; btn.innerHTML = old; }
+  };
+}
+var engineWatch = false;
+async function watchEngine() {
+  if (engineWatch) return;
+  engineWatch = true;
+  var b = busy($("btnStartEngine"), "Starting…");
+  var bar = $("task-bar");
+  // There is no honest percentage for a model load, so show the real thing:
+  // elapsed time on the button, a moving bar, and ComfyUI's own console.
+  $("task-title").textContent = "Starting the engine — the first start loads "
+    + "PyTorch and the models, which can take a few minutes. Its console:";
+  bar.hidden = false;
+  bar.classList.add("indet");
+  var began = Date.now();
   try {
-    await api("/api/comfy/start", { method: "POST" });
-    toast("Starting ComfyUI. The first start is slow.");
+    while (Date.now() - began < 5 * 60 * 1000) {
+      await new Promise(function (t) { setTimeout(t, 1500); });
+      b.label("Starting… " + Math.round((Date.now() - began) / 1000) + "s");
+      try {
+        var snap = await api("/api/setup/state?since=999999");
+        if (snap.comfy_tail && snap.comfy_tail.length) {
+          var log = $("task-log");
+          log.textContent = snap.comfy_tail.join("\n");
+          log.scrollTop = log.scrollHeight;
+        }
+      } catch (e) { /* the console feed is a nicety */ }
+      var st = null;
+      try { st = await api("/api/status"); } catch (e) { continue; }
+      if (st.comfy_online) {
+        $("task-title").textContent = "The engine is up.";
+        toast("The engine is up.");
+        await refreshStatus();
+        loadDeps();
+        return;
+      }
+      if (st.comfy_running_managed === false) {
+        $("task-title").textContent = "The engine stopped while starting — "
+          + "its last words are below.";
+        toast("ComfyUI stopped while starting — see the Activity log on "
+          + "the Engine page.", true);
+        refreshStatus();
+        loadDeps();
+        return;
+      }
+    }
+    $("task-title").textContent = "Still not answering after five minutes — "
+      + "its console is below.";
+    toast("The engine did not come up within five minutes — see the "
+      + "Activity log.", true);
+  } finally {
+    engineWatch = false;
+    b.done();
+    bar.classList.remove("indet");
+    bar.hidden = true;
+  }
+}
+async function startEngine() {
+  if (engineWatch) {
+    toast("It is already starting — its console is in the Activity log on "
+      + "the Engine page.");
+    return;
+  }
+  try {
+    var r = await api("/api/comfy/start", { method: "POST" });
+    if (r && r.already) {
+      toast("The engine is already running on that address.");
+      refreshStatus();
+      return;
+    }
+    if (r && r.starting) toast("It was already starting — watching it.");
+    watchEngine();
   } catch (e) { toast(e.message, true); }
 }
 var taskTimer = null;
@@ -1754,12 +1845,18 @@ async function refreshStatus() {
   try { st = await api("/api/status"); } catch (e) { return; }
   S.status = st;
   var pill = $("enginePill");
+  var starting = !st.comfy_online && !!st.comfy_running_managed;
   pill.classList.toggle("on", !!st.ready);
-  pill.classList.toggle("off", !st.comfy_online);
+  pill.classList.toggle("off", !st.comfy_online && !starting);
+  pill.classList.toggle("starting", starting);
   pill.querySelector("span").textContent = st.ready ? "Engine ready"
+    : starting ? "Engine starting…"
     : !st.comfy_online ? "Engine offline"
     : !st.nodes_ready ? "Nodes not loaded"
     : st.missing_models.length ? "Weights missing" : "Engine loading";
+  // The app starts ComfyUI itself on launch; without this, that start is
+  // invisible and the pill reads "offline" until the model finishes loading.
+  if (starting) watchEngine();
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
   setEngineTag("status", !(st.comfy_online && st.nodes_ready));
   $("genLabel").textContent = st.ready ? "Generate" : "Set up";
@@ -1933,7 +2030,11 @@ function wire() {
     generate();
   });
 
-  $("btnRecheck").addEventListener("click", function () { loadDeps(); refreshStatus(); });
+  $("btnRecheck").addEventListener("click", async function () {
+    var b = busy($("btnRecheck"), "Checking…");
+    try { await Promise.all([loadDeps(), refreshStatus()]); }
+    finally { b.done(); }
+  });
   $("btnInstallAll").addEventListener("click", installAllMissing);
   $("btnStartEngine").addEventListener("click", startEngine);
   $("btnReRun").addEventListener("click", openSetup);

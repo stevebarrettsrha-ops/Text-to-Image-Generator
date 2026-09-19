@@ -163,7 +163,7 @@ def _probe(python: str, code: str, timeout: int = 90) -> tuple[int, str]:
 # --------------------------------------------------------------------------- #
 # dependency report
 # --------------------------------------------------------------------------- #
-def dependencies(cfg: dict, client=None) -> list[dict]:
+def dependencies(cfg: dict, client=None, starting: bool = False) -> list[dict]:
     items: list[dict] = []
 
     try:
@@ -267,11 +267,18 @@ def dependencies(cfg: dict, client=None) -> list[dict]:
                       "action": "models"})
 
     online = bootstrap.comfy_online(cfg["comfy_url"])
-    items.append({"id": "engine", "label": "Engine",
-                  "state": "ok" if online else "missing",
-                  "detail": cfg["comfy_url"] if online
-                  else "ComfyUI is not answering.",
-                  "action": None if online else "start"})
+    if online:
+        items.append({"id": "engine", "label": "Engine", "state": "ok",
+                      "detail": cfg["comfy_url"], "action": None})
+    elif starting:
+        items.append({"id": "engine", "label": "Engine", "state": "warn",
+                      "detail": "Starting — the first start loads PyTorch and "
+                                "the models, which can take a few minutes.",
+                      "action": None})
+    else:
+        items.append({"id": "engine", "label": "Engine", "state": "missing",
+                      "detail": "ComfyUI is not answering.",
+                      "action": "start"})
     return items
 
 

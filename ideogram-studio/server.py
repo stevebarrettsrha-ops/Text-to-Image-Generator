@@ -175,10 +175,10 @@ def run_job(job_id: str, params: dict) -> None:
                 jobs[job_id].update(kw)
 
     try:
-        set_state(stage="Building the graph", pct=2)
+        set_state(stage="Building the graph", pct=2, vague=True)
         built = client.build(params)
         prompt_id = client.queue(built["prompt"])
-        set_state(prompt_id=prompt_id, seed=built["seed"], pct=5,
+        set_state(prompt_id=prompt_id, seed=built["seed"], pct=5, vague=True,
                   stage="Queued in ComfyUI")
 
         started = time.time()
@@ -203,16 +203,25 @@ def run_job(job_id: str, params: dict) -> None:
             value, maximum = wp.get("value", 0), wp.get("max", 0)
             if maximum:
                 set_state(pct=round(6 + min(value / maximum, 1) * 88, 1),
-                          stage=f"Step {value} of {maximum}")
+                          vague=False, stage=f"Step {value} of {maximum}")
             else:
-                set_state(pct=min(5 + (time.time() - started) / 4, 12),
-                          stage="Loading the model")
+                # No step progress yet means ComfyUI is loading weights. There
+                # is no percentage for that, and the weights are bigger than
+                # most cards, so say how long it has been instead of pinning a
+                # made-up number on the bar.
+                waited = int(time.time() - started)
+                been = (f"{waited // 60}m {waited % 60:02d}s" if waited >= 60
+                        else f"{waited}s")
+                note = (" · the first run is the slow one" if waited > 90
+                        else "")
+                set_state(pct=min(5 + waited / 4, 12), vague=True,
+                          stage=f"Loading the model — {been}{note}")
             if time.time() - started > 3600:
                 set_state(status="error", stage="Timed out",
                           error="No image after an hour. Check the ComfyUI log.")
                 return
 
-        set_state(stage="Saving", pct=96)
+        set_state(stage="Saving", pct=96, vague=False)
         IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         saved = []
         for index, item in enumerate(outs):
@@ -286,6 +295,9 @@ def api_status():
         missing = [m["name"] for m in bootstrap.missing_models(models_dir, cfg)]
     payload = {
         "comfy_online": online,
+        # Alive but not answering yet is "starting", not "offline" — the first
+        # start loads PyTorch and the models, which takes minutes.
+        "comfy_running_managed": comfy_proc.alive(),
         "setup_complete": bool(cfg.get("setup_complete")),
         "missing_models": missing,
         "detected": detect_comfy_dirs(),
@@ -340,8 +352,15 @@ def api_setup_state():
 def api_comfy_start():
     if comfy_online(cfg["comfy_url"]):
         return jsonify({"ok": True, "already": True})
+    if comfy_proc.alive():
+        return jsonify({"ok": True, "starting": True})
     py = bootstrap.comfy_python(cfg)
     if not cfg.get("comfy_dir") or not py:
+        if cfg.get("comfy_dir") and not cfg.get("managed", True):
+            return jsonify({"error": "Ideogram Studio does not know which "
+                            "Python that ComfyUI runs on, so it will not start "
+                            "it. Start ComfyUI yourself, then press "
+                            "Recheck."}), 400
         return jsonify({"error": "Run setup first."}), 400
     comfy_proc.start(py, Path(cfg["comfy_dir"]),
                      int(cfg["comfy_url"].rsplit(":", 1)[-1]), progress)
@@ -366,7 +385,8 @@ def api_config():
 @app.get("/api/deps")
 def api_deps():
     live = client if comfy_online(cfg["comfy_url"]) else None
-    return jsonify({"items": manager.dependencies(cfg, live),
+    return jsonify({"items": manager.dependencies(cfg, live,
+                                                  starting=comfy_proc.alive()),
                     "torch_index": cfg.get("torch_index", "")})
 
 
@@ -509,6 +529,7 @@ def api_generate():
         with jobs_lock:
             prune_jobs()
             jobs[job_id] = {"id": job_id, "status": "running", "pct": 0,
+                            "vague": True,
                             "stage": "Starting", "created": time.time(),
                             "title": params.get("title") or title_from(params)}
         threading.Thread(target=run_job, args=(job_id, dict(params)),
