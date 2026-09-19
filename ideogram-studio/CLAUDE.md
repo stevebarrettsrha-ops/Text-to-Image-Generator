@@ -42,6 +42,32 @@ itself, so their packs are deliberately **not** installed. Only ComfyUI-Manager
 and KJNodes are. If a future change needs one, add it to `CUSTOM_NODES` in
 bootstrap.py; the installer and the Engine page pick it up automatically.
 
+## Reading /object_info
+
+ComfyUI's V3 node API serialises every input as `(io_type, options)`, so a
+dropdown arrives as `("COMBO", {"options": [...]})` and a dynamic one as
+`("COMFY_DYNAMICCOMBO_V3", {"options": [{"key", "inputs"}]})` — not the old
+`([...options], {...})`. `_node()` fills any input it was not asked for from the
+schema default, and it has to understand all three shapes or the input is left
+out and ComfyUI answers "Required input is missing". It also skips anything
+marked `forceInput`: that is a link, and there is no widget value to give it.
+
+`Ideogram4PromptBuilderKJ` is now a V3 node, which moved two inputs this app
+fills:
+
+- **`style` is a dynamic combo.** The prompt carries the chosen key
+  (`none` / `photo` / `art_style`) under `style`, and the text for that branch
+  under the dotted path the expansion creates — `style.photo`,
+  `style.art_style`. Those nested ids are not in `/object_info` until a key is
+  picked, so they are set by hand rather than matched. The UI's style word and
+  style detail map onto it: "photo" takes the photo branch, anything else is an
+  art style, neither is `none`.
+- **Regions go in `elements_data`**, as the same normalised list the editor
+  keeps. `bboxes` is a link-only BOUNDINGBOX input now (pixel-space, and only
+  ever a seed), so writing region JSON there silently loses placement. Older
+  builds took that JSON on `bboxes` as a string, so the shape in `/object_info`
+  decides which one to use, never a version number.
+
 ## Graceful degradation
 
 Without KJNodes there is no `Ideogram4PromptBuilderKJ`, so `build()` falls back to

@@ -211,6 +211,35 @@ class ComfyClient:
                 return low[c.lower()]
         return None
 
+    # ComfyUI's V3 node API serialises inputs as (io_type, options) rather than
+    # the old (type_or_enum_list, options), so a dropdown now arrives as
+    # ("COMBO", {"options": [...]}) and a dynamic one as
+    # ("COMFY_DYNAMICCOMBO_V3", {"options": [{"key": ..., "inputs": {...}}]}).
+    # Reading only the old shape leaves such inputs unset, and ComfyUI rejects
+    # the prompt with "Required input is missing".
+    DYNAMIC_COMBO = "COMFY_DYNAMICCOMBO_V3"
+
+    @staticmethod
+    def _spec_parts(definition) -> tuple[object, dict]:
+        """(kind, options) for one /object_info input, whichever shape it is in."""
+        if not isinstance(definition, (list, tuple)) or not definition:
+            return None, {}
+        opts = definition[1] if len(definition) > 1 else {}
+        return definition[0], opts if isinstance(opts, dict) else {}
+
+    @classmethod
+    def _choices(cls, definition) -> list[str]:
+        """The values a dropdown accepts, for either serialisation."""
+        kind, opts = cls._spec_parts(definition)
+        if isinstance(kind, list):
+            return [str(v) for v in kind]
+        if kind == "COMBO":
+            return [str(v) for v in (opts.get("options") or [])]
+        if kind == cls.DYNAMIC_COMBO:
+            return [str(o.get("key")) for o in (opts.get("options") or [])
+                    if isinstance(o, dict) and o.get("key") is not None]
+        return []
+
     def _node(self, class_type: str, wanted: dict) -> dict:
         spec = self.node_inputs(class_type)
         inputs: dict = {}
@@ -227,14 +256,15 @@ class ComfyClient:
         for name, definition in spec.items():
             if name in inputs or name == "control_after_generate":
                 continue
-            if not isinstance(definition, (list, tuple)) or not definition:
-                continue
-            kind = definition[0]
-            opts = definition[1] if len(definition) > 1 else {}
-            if not isinstance(opts, dict):
-                opts = {}
-            if isinstance(kind, list):
-                inputs[name] = opts.get("default", kind[0] if kind else "")
+            kind, opts = self._spec_parts(definition)
+            if kind is None or opts.get("forceInput"):
+                continue          # a link-only input has no widget value to give
+            if isinstance(kind, list) or kind in ("COMBO", self.DYNAMIC_COMBO):
+                choices = self._choices(definition)
+                if "default" in opts:
+                    inputs[name] = opts["default"]
+                elif choices:
+                    inputs[name] = choices[0]
             elif kind in ("INT", "FLOAT", "STRING", "BOOLEAN"):
                 if "default" in opts:
                     inputs[name] = opts["default"]
@@ -260,6 +290,70 @@ class ComfyClient:
             elif desc:
                 bits.append(desc)
         return ", ".join([b for b in bits if b])
+
+    def _prompt_builder(self, p: dict, width: int, height: int) -> dict:
+        """The KJ prompt builder node.
+
+        Its schema moved to ComfyUI's V3 API, which changed two inputs this app
+        fills: `style` became a dynamic combo whose chosen key ("none", "photo",
+        "art_style") decides which nested text input exists, and the regions
+        moved to `elements_data` because `bboxes` is now a link-only
+        BOUNDINGBOX. Older builds carried both as plain strings, so the shape in
+        /object_info decides, not the version number.
+        """
+        spec = self.node_inputs(PROMPT_BUILDER)
+        wanted = {
+            "width": {"names": ["width"], "value": width},
+            "height": {"names": ["height"], "value": height},
+            "description": {"names": ["high_level_description", "description"],
+                            "value": p.get("description", ""), "required": True},
+            "background": {"names": ["background"], "value": p.get("background", "")},
+            "aesthetics": {"names": ["aesthetics"], "value": p.get("aesthetics", "")},
+            "lighting": {"names": ["lighting"], "value": p.get("lighting", "")},
+            "medium": {"names": ["medium"], "value": p.get("medium", "")},
+        }
+
+        # Regions go in as the editor's own list: normalised x/y/w/h plus type,
+        # text, desc and palette. The current node reads it from elements_data;
+        # older ones took the identical JSON on bboxes, which is a link now.
+        regions = json.dumps(p.get("regions") or [])
+        for name in ("elements_data", "bboxes"):
+            kind, opts = self._spec_parts(spec.get(name))
+            if kind == "STRING" and not opts.get("forceInput"):
+                wanted["regions"] = {"names": [name], "value": regions}
+                break
+
+        # Style. The UI keeps a style word and a detail line; the node wants one
+        # branch and one string, so "photo" picks the photo branch and anything
+        # else is an art style. The nested input only exists once the key is
+        # chosen, so /object_info never lists it — it is set by hand below.
+        extra: dict = {}
+        style = (p.get("style") or "").strip()
+        detail = (p.get("style_photo") or "").strip()
+        keys = self._choices(spec.get("style"))
+        if keys:
+            branch = ""
+            if "photo" in style.lower() and "photo" in keys:
+                branch = "photo"
+                text = ", ".join(b for b in (style, detail)
+                                 if b and b.lower() != "photo")
+            elif (style or detail) and "art_style" in keys:
+                branch = "art_style"
+                text = ", ".join(b for b in (style, detail) if b)
+            if branch:
+                wanted["style"] = {"names": ["style"], "value": branch}
+                extra[f"style.{branch}"] = text
+            else:
+                wanted["style"] = {"names": ["style"],
+                                   "value": "none" if "none" in keys else keys[0]}
+        else:
+            wanted["style"] = {"names": ["style"], "value": style}
+            wanted["style_photo"] = {"names": ["style.photo", "style_photo"],
+                                     "value": detail}
+
+        node = self._node(PROMPT_BUILDER, wanted)
+        node["inputs"].update(extra)
+        return node
 
     def build(self, p: dict) -> dict:
         """p: description, background, style, style_photo, aesthetics, lighting,
@@ -298,21 +392,7 @@ class ComfyClient:
         # prompt
         text_source: object
         if self.has(PROMPT_BUILDER) and p.get("use_builder", True):
-            g["5"] = self._node(PROMPT_BUILDER, {
-                "width": {"names": ["width"], "value": width},
-                "height": {"names": ["height"], "value": height},
-                "description": {"names": ["high_level_description", "description"],
-                                "value": p.get("description", ""), "required": True},
-                "background": {"names": ["background"], "value": p.get("background", "")},
-                "style": {"names": ["style"], "value": p.get("style", "")},
-                "style_photo": {"names": ["style.photo", "style_photo"],
-                                "value": p.get("style_photo", "")},
-                "aesthetics": {"names": ["aesthetics"], "value": p.get("aesthetics", "")},
-                "lighting": {"names": ["lighting"], "value": p.get("lighting", "")},
-                "medium": {"names": ["medium"], "value": p.get("medium", "")},
-                "bboxes": {"names": ["bboxes"],
-                           "value": json.dumps(p.get("regions") or [])},
-            })
+            g["5"] = self._prompt_builder(p, width, height)
             text_source = ["5", 0]
         else:
             text_source = self.plain_prompt(p)
@@ -530,8 +610,15 @@ class ComfyClient:
 def _readable(err: dict) -> str:
     for node_id, info in (err.get("node_errors") or {}).items():
         for e in info.get("errors", []):
-            return (f"{info.get('class_type', 'node ' + str(node_id))}: "
-                    f"{e.get('message')} {e.get('details', '')}".strip())
+            msg = (f"{info.get('class_type', 'node ' + str(node_id))}: "
+                   f"{e.get('message')} {e.get('details', '')}".strip())
+            if "required input is missing" in (e.get("message") or "").lower():
+                # The graph is built from /object_info, so this means the node
+                # gained an input whose shape the builder could not read.
+                msg += (" \u2014 the installed node wants an input Ideogram Studio "
+                        "does not know about. Update the node pack on the Engine "
+                        "page; if it is already current, the app needs the fix.")
+            return msg
     top = err.get("error") or {}
     if top:
         return f"{top.get('message', 'Rejected by ComfyUI')} " \
