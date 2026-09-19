@@ -128,7 +128,9 @@ and says so when a lighter weight set would be the better idea.
 
 **Models** holds the three weight sets with per-file status, the HuggingFace token
 and mirror, a repo browser, live download progress with Stop, and delete. Downloads
-resume where they stopped.
+resume where they stopped. All three sets are listed, but you only ever need one:
+only the set you are using can be short of anything, and files belonging to the
+other two read *not needed* rather than *missing*.
 
 ---
 
