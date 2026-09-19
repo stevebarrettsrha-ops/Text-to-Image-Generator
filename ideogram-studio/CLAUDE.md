@@ -67,6 +67,30 @@ the same way if absent.
   against the live `/object_info` enum and tell the person to restart rather than
   letting the graph fail.
 
+## Progress reporting
+
+The first run is long and mostly silent from the outside, so every step says
+where it is. `Progress.track(key, pct, detail)` moves one step's bar; `pct=None`
+means "running, no number to give" and draws an indeterminate bar rather than a
+fake 0%. Sources of a real number:
+
+- **git** — `git_run`/`git_clone` pass `--progress` and `_stream` splits on `\r`,
+  so the phase lines arrive while the clone runs. `GIT_WEIGHT` stacks the phases
+  into one bar that only moves forwards, and git runs under `LC_ALL=C` because
+  the phase names are matched in English.
+- **pip** — its bar disappears when stdout is a pipe, which is what made a
+  2.4 GB torch wheel look like a hang. `--progress-bar raw` prints
+  `Progress <done> of <total>` instead; `pip_has_raw_progress` asks pip whether
+  it has the option (older ones do not) and the answer is dropped after pip
+  upgrades itself.
+- **downloads** — the weights bar is over the whole set, so `hf_tree` is asked
+  for the real sizes first. Falling back to per-file percentages is fine; a bar
+  that restarts four times is not.
+
+`snapshot()` sends the steps as an **ordered list**, not a dict: Flask sorts JSON
+object keys, which served them alphabetically and put "Check Python" last.
+`app.json.sort_keys = False` covers the rest of the API.
+
 ## Validation gate — run after any edit
 
 ```bash

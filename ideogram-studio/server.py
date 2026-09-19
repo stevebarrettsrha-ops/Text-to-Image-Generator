@@ -31,6 +31,9 @@ WEB_DIR = APP_DIR / "web"
 PORT = int(os.environ.get("IDEOGRAM_STUDIO_PORT", "7802"))
 
 app = Flask(__name__, static_folder=None)
+# Flask sorts JSON object keys by default, which would reorder anything
+# the page shows in the order the server put it in.
+app.json.sort_keys = False
 
 
 @app.before_request
