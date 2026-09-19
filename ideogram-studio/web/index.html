@@ -458,6 +458,7 @@
         <p class="sub">Ideogram 4 is a pair — a conditional and an unconditional model —
           plus the Qwen3-VL text encoder and the Flux 2 VAE. Pick the precision that
           suits your card; everything comes from Comfy-Org/Ideogram-4.</p>
+        <p class="sub" id="sets-summary"></p>
         <div id="setsList"></div>
         <p class="note">The weights are under Ideogram's non-commercial licence. If a
           download is refused, accept it on the model page and add a token below.</p>
@@ -1493,21 +1494,23 @@ async function loadHf() {
     box.innerHTML = "";
     Object.keys(s.curated.sets).forEach(function (key) {
       var set = s.curated.sets[key];
+      var mine = key === s.curated.precision;
       var el = document.createElement("div");
-      el.className = "setrow" + (key === s.curated.precision ? " on" : "");
+      el.className = "setrow" + (mine ? " on" : "");
       el.innerHTML = '<div class="n"><b>' + esc(set.label) + "</b><span>" +
         esc(set.note) + '</span></div><div class="right"><span class="state ' +
         (set.complete ? "ok" : "") + '">' +
         (set.complete ? "installed" : set.files.filter(function (f) {
-          return f.installed; }).length + " of " + set.files.length) +
+          return f.installed; }).length + " of " + set.files.length +
+          (mine ? "" : " · not in use")) +
         "</span></div>";
       var right = el.querySelector(".right");
       if (!set.complete) {
         var b = mkBtn("Download set", function () { downloadSet(key, b); });
-        if (key === s.curated.precision) b.className = "btn thin go";
+        if (mine) b.className = "btn thin go";
         right.appendChild(b);
       }
-      if (key !== s.curated.precision) {
+      if (!mine) {
         right.appendChild(mkBtn("Use this", function () { usePrecision(key); }));
       }
       box.appendChild(el);
@@ -1515,13 +1518,27 @@ async function loadHf() {
         var fe = document.createElement("div");
         fe.className = "fitem";
         fe.style.marginLeft = "14px";
+        // Only the set in use can be short of anything. A file belonging to one
+        // of the other two is not missing, it is a weight set you did not pick.
+        var state = f.installed ? "ok" : (mine ? "missing" : "");
+        var word = f.installed ? "have it" : (mine ? "missing" : "not needed");
         fe.innerHTML = '<div class="n"><b>' + esc(f.name) + "</b><span>" +
           esc(f.folder) + " · " + esc(f.why) + '</span></div><div class="right">' +
-          '<span class="state ' + (f.installed ? "ok" : "missing") + '">' +
-          (f.installed ? "have it" : "missing") + "</span></div>";
+          '<span class="state ' + state + '">' + word + "</span></div>";
         box.appendChild(fe);
       });
     });
+    var cur = s.curated.sets[s.curated.precision];
+    var short = cur ? cur.files.filter(function (f) { return !f.installed; }).length : 0;
+    $("sets-summary").textContent = !cur ? ""
+      : short === 0
+        ? "You are on the " + cur.label.split(" — ")[0] + " set and it is "
+          + "complete. The other sets are alternatives for other cards — you "
+          + "only ever need one, so anything they list is marked not needed."
+        : "You are on the " + cur.label.split(" — ")[0] + " set, which still "
+          + "needs " + short + " file" + (short === 1 ? "" : "s") + " — those "
+          + "are the ones marked missing. The other sets are alternatives for other "
+          + "cards; you only ever need one.";
   } catch (e) { toast(e.message, true); }
 }
 async function usePrecision(key) {
