@@ -14,6 +14,10 @@
     --obj:#d4a017; --txt:#3ddc97;
     --ok:#3ddc97; --warn:#ffb020; --err:#ff5a5a;
     --rail:194px;
+    /* Native UI follows this: the dropdown list a select opens is drawn by the
+       browser, not the page. Without it that list is light while its options
+       inherit the page's near-white text — white on white, unreadable. */
+    color-scheme:dark;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
@@ -32,6 +36,10 @@
     border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-size:13px;
     color:var(--text);width:100%}
   input:focus,select:focus,textarea:focus{outline:none;border-color:#3a3a46}
+  /* Belt and braces for the platforms that colour the list from the page
+     rather than from color-scheme. .pill select is transparent, so its options
+     need a background of their own either way. */
+  option{background:#16161c;color:var(--text)}
   textarea{resize:vertical}
   .flab{font-size:11px;color:var(--muted);margin-bottom:5px;display:block}
 
