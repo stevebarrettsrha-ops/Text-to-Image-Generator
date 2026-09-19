@@ -30,6 +30,14 @@ Setup then does, in order:
    virtual environment beside it otherwise
 3. downloads the Ideogram 4 weights into `ComfyUI/models/`
 
+Each step reports itself while it runs: which of the six it is on, a bar, and a
+percentage with the bytes, speed and time left behind it. The weights bar covers
+the whole set, not one file at a time, so it only ever moves forwards; PyTorch
+reports per wheel, because pip gives no total for an install. Anything with no
+number to report — creating the environment, waiting for ComfyUI to come up —
+says what it is doing and how long it has been at it rather than showing a
+stalled 0%.
+
 ### Requirements
 
 - Python 3.10 or newer, and Git

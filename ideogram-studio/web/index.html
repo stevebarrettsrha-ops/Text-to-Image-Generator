@@ -285,9 +285,19 @@
   .step.running .mark{border-color:var(--accent);color:#cdbcff}
   .step.done .mark{background:var(--ok);border-color:var(--ok);color:#06210f}
   .step.error .mark{background:var(--err);border-color:var(--err);color:#2a0606}
-  .step .lbl{font-size:13.5px;font-weight:500}
+  .step .body{flex:1;min-width:0}
+  .step .lbl{font-size:13.5px;font-weight:500;display:flex;gap:10px;
+             justify-content:space-between;align-items:baseline}
+  .step .pc{font-size:12px;font-weight:600;color:#cdbcff;flex:none;
+            font-variant-numeric:tabular-nums}
   .step .dt{font-size:12px;color:var(--dim);margin-top:2px;word-break:break-word}
   .step.error .dt{color:#ff9a9a}
+  .step .bar4{margin-top:7px}
+  /* No byte count to go on — a moving sliver says "working", not "0%". */
+  .bar4.indet i{width:34%;animation:slide 1.3s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
+  .stephead{font-size:12px;color:var(--muted);margin:14px 0 0;
+            font-variant-numeric:tabular-nums}
   .pick{display:flex;flex-direction:column;gap:8px;margin:14px 0}
   .pick label{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;
         border-radius:12px;border:1px solid var(--line);background:var(--raised);
@@ -514,7 +524,8 @@
       <div class="panel">
         <h2>Activity</h2>
         <p class="sub" id="task-title">Nothing running.</p>
-        <div class="log" id="task-log"></div>
+        <div class="bar4" id="task-bar" hidden><i style="width:0%"></i></div>
+        <div class="log" id="task-log" style="margin-top:10px"></div>
         <div class="rowbtn"><button class="btn" id="btnCancelTask" hidden>Stop</button></div>
       </div>
     </section>
@@ -627,6 +638,7 @@
       <p class="note">No Git or Python yet? The Engine page installs them for you.</p>
     </div>
     <div id="setup-progress" hidden>
+      <p class="stephead" id="setup-head"></p>
       <div class="steps" id="step-list"></div>
       <div class="log" id="setup-log"></div>
       <div class="rowbtn">
@@ -1437,7 +1449,10 @@ async function pollTasks() {
     try {
       var t = await api("/api/tasks?id=" + S.taskId + "&since=" + S.taskCursor);
       S.taskCursor = t.cursor;
-      $("task-title").textContent = t.title + " — " + (t.detail || t.state);
+      $("task-title").textContent = t.title + " — " + (t.detail || t.state) +
+        (t.state === "running" && t.pct ? " · " + Math.round(t.pct) + "%" : "");
+      $("task-bar").hidden = t.state !== "running";
+      $("task-bar").firstElementChild.style.width = Math.round(t.pct || 0) + "%";
       if (t.lines.length) {
         var log = $("task-log");
         var bottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
@@ -1674,18 +1689,35 @@ async function pollSetup() {
     log.textContent += st.lines.join("\n") + "\n";
     if (bottom) log.scrollTop = log.scrollHeight;
   }
+  var steps = st.steps || [];
   var list = $("step-list");
   list.innerHTML = "";
-  Object.keys(st.steps).forEach(function (k) {
-    var s = st.steps[k];
+  var running = null, doneCount = 0;
+  steps.forEach(function (s, i) {
+    if (s.state === "done") doneCount++;
+    if (s.state === "running" && !running) { running = s; s.no = i + 1; }
+    var pct = (typeof s.pct === "number") ? Math.round(s.pct) : null;
     var d = document.createElement("div");
     d.className = "step " + s.state;
     d.innerHTML = '<span class="mark">' +
       (s.state === "done" ? "✓" : s.state === "error" ? "!" : "") +
-      '</span><div><div class="lbl">' + esc(s.label) + '</div><div class="dt">' +
-      esc(s.detail || "") + "</div></div>";
+      '</span><div class="body"><div class="lbl"><span>' + esc(s.label) +
+      "</span>" + (pct === null ? "" : '<span class="pc">' + pct + "%</span>") +
+      '</div><div class="dt">' + esc(s.detail || "") + "</div>" +
+      (s.state === "running"
+        ? (pct === null ? '<div class="bar4 indet"><i></i></div>'
+                        : '<div class="bar4"><i style="width:' + pct + '%"></i></div>')
+        : "") + "</div>";
     list.appendChild(d);
   });
+  var head = $("setup-head");
+  if (st.done) head.textContent = "Done — all " + steps.length + " steps finished.";
+  else if (st.error) head.textContent = "Stopped after " + doneCount + " of " +
+    steps.length + " steps. The log below says why.";
+  else if (running) head.textContent = "Step " + running.no + " of " + steps.length +
+    " · " + running.label +
+    (typeof running.pct === "number" ? " · " + Math.round(running.pct) + "%" : "");
+  else head.textContent = "Starting…";
   if (st.done) { $("setup-done").hidden = false; await refreshStatus(); return; }
   if (st.error) { $("setup-retry").hidden = false; return; }
   setupTimer = setTimeout(pollSetup, 1200);

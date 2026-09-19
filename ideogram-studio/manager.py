@@ -129,6 +129,26 @@ def stream(cmd: list[str], task: Task, keep: tuple[str, ...] = ()) -> int:
     return proc.wait()
 
 
+def _git_task(task: Task, head: str = ""):
+    """Point git's progress at a task's bar, the same way setup does."""
+    def on_pct(phase: str, pct: float) -> None:
+        start, width = bootstrap.GIT_WEIGHT.get(phase, (0.0, 0.0))
+        line = f"{phase} — {pct:.0f}%"
+        task.set(pct=(start + width * pct / 100) * 100,
+                 detail=f"{head} · {line}" if head else line)
+    return on_pct
+
+
+def _pip_task(task: Task, head: str):
+    """Point pip's download progress at a task's bar. The bar is per wheel —
+    pip gives no total for the whole install — so it restarts for each file,
+    and the detail says which one. A phase with no byte count leaves it alone."""
+    def on_pct(pct: float | None, detail: str) -> None:
+        task.set(detail=f"{head} · {detail}",
+                 **({} if pct is None else {"pct": pct}))
+    return on_pct
+
+
 def _probe(python: str, code: str, timeout: int = 90) -> tuple[int, str]:
     if not python or not Path(python).exists():
         return 1, "no interpreter"
@@ -306,12 +326,19 @@ def _install_comfyui(task: Task, cfg: dict) -> None:
     target = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else APP_DIR / "ComfyUI"
     if (target / "main.py").exists():
         task.set(detail="Updating ComfyUI…")
-        stream(["git", "-C", str(target), "pull", "--ff-only"], task)
+        bootstrap.git_run(["git", "-C", str(target), "pull", "--ff-only",
+                           "--progress"], task.log, _git_task(task),
+                          lambda: task.cancel)
     else:
         task.set(detail="Downloading ComfyUI…")
-        if stream(["git", "clone", "--depth", "1", bootstrap.COMFY_REPO,
-                   str(target)], task) != 0:
+        code, _ = bootstrap.git_clone(bootstrap.COMFY_REPO, target, task.log,
+                                      _git_task(task),
+                                      should_cancel=lambda: task.cancel)
+        if not task.cancel and code != 0:
             raise RuntimeError("git clone failed — see the log.")
+    if task.cancel:
+        task.set(state="cancelled", detail="Cancelled")
+        return
     cfg["comfy_dir"] = str(target)
     cfg["models_dir"] = cfg.get("models_dir") or str(target / "models")
     bootstrap.save_config(cfg)
@@ -325,12 +352,21 @@ def _install_node(task: Task, cfg: dict, node: dict) -> None:
     if not have_git():
         raise RuntimeError("Install Git first.")
     task.set(detail=f"Installing {node['label']}…")
-    path = bootstrap.clone_node(node, comfy_dir, task.log)
+    try:
+        path = bootstrap.clone_node(node, comfy_dir, task.log,
+                                    _git_task(task, node["label"]),
+                                    lambda: task.cancel)
+    except RuntimeError:
+        if not task.cancel:
+            raise
+        task.set(state="cancelled", detail="Cancelled")
+        return
     py = comfy_python(cfg)
     reqs = path / "requirements.txt"
     if py and reqs.exists():
-        task.set(detail="Installing its requirements…")
-        bootstrap.pip_install(py, ["-r", str(reqs)], task.log)
+        task.set(pct=0, detail="Installing its requirements…")
+        bootstrap.pip_install(py, ["-r", str(reqs)], task.log,
+                              _pip_task(task, "Requirements"))
     task.set(detail="Installed. Restart ComfyUI so it loads the node.")
 
 
@@ -355,15 +391,19 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
         cfg["torch_index"] = opts["torch_index"]
     bootstrap.save_config(cfg)
     index = bootstrap.torch_index(cfg)
-    task.set(detail="Installing PyTorch — this is the long one…")
-    bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"], task.log)
+    task.set(pct=0, detail="Updating pip…")
+    bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"], task.log,
+                          _pip_task(task, "pip and wheel"))
     args = ["torch", "torchvision"]
     if index:
         args += ["--index-url", index]
-    bootstrap.pip_install(str(target), args, task.log)
-    task.set(detail="Installing ComfyUI requirements…")
+    task.set(pct=0, detail="Installing PyTorch — this is the long one…")
+    bootstrap.pip_install(str(target), args, task.log,
+                          _pip_task(task, "PyTorch"))
+    task.set(pct=0, detail="Installing ComfyUI requirements…")
     bootstrap.pip_install(str(target),
-                          ["-r", str(comfy_dir / "requirements.txt")], task.log)
+                          ["-r", str(comfy_dir / "requirements.txt")], task.log,
+                          _pip_task(task, "ComfyUI requirements"))
     task.set(detail="PyTorch installed.")
 
 
@@ -418,9 +458,7 @@ def hf_download(cfg: dict, repo: str, path: str, folder: str = "") -> Task:
 
         def on_prog(got, total, speed, eta):
             task.set(pct=(got / total * 100) if total else 0,
-                     detail=f"{got/1e9:.2f} / {total/1e9:.2f} GB · "
-                            f"{speed/1e6:.1f} MB/s · "
-                            f"{int(eta//60)}m {int(eta%60)}s left")
+                     detail=bootstrap.fmt_transfer(got, total, speed, eta))
 
         bootstrap.download_file(cfg, repo, path, dest, on_prog,
                                 lambda: task.cancel)
@@ -429,7 +467,8 @@ def hf_download(cfg: dict, repo: str, path: str, folder: str = "") -> Task:
                      detail="Cancelled — the part that downloaded is kept, and "
                             "starting again carries on from there.")
             return
-        task.set(pct=100, detail=f"Saved — {dest.stat().st_size/1e9:.2f} GB")
+        task.set(pct=100,
+                 detail="Saved — " + bootstrap.fmt_size(dest.stat().st_size))
 
     return spawn("download", name, run, {"repo": repo, "path": path,
                                          "dest": str(dest), "name": name})

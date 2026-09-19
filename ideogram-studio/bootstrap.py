@@ -17,12 +17,14 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 import requests
 
@@ -165,8 +167,8 @@ class Progress:
         self.done = False
         self.error: str | None = None
         self.step = ""
-        self.steps = {k: {"label": v, "state": "pending", "detail": ""}
-                      for k, v in self.STEPS}
+        self.steps = {k: {"key": k, "label": v, "state": "pending",
+                          "detail": "", "pct": None} for k, v in self.STEPS}
 
     def log(self, msg: str) -> None:
         with self._lock:
@@ -180,28 +182,76 @@ class Progress:
             self.step = key
             self.steps[key]["state"] = "running"
             self.steps[key]["detail"] = detail
+            self.steps[key]["pct"] = None
 
     def detail(self, key: str, detail: str) -> None:
         with self._lock:
             self.steps[key]["detail"] = detail
 
+    def track(self, key: str, pct: float | None, detail: str = "") -> None:
+        """Move a step's bar. `pct` None means running with no number yet —
+        the front end shows an indeterminate bar rather than a fake 0%."""
+        with self._lock:
+            self.steps[key]["pct"] = (None if pct is None
+                                      else round(max(0.0, min(100.0, pct)), 1))
+            if detail:
+                self.steps[key]["detail"] = detail
+
     def finish(self, key: str, detail: str = "") -> None:
         with self._lock:
             self.steps[key]["state"] = "done"
+            self.steps[key]["pct"] = None
             if detail:
                 self.steps[key]["detail"] = detail
 
     def fail(self, key: str, detail: str) -> None:
         with self._lock:
             self.steps[key]["state"] = "error"
+            self.steps[key]["pct"] = None
             self.steps[key]["detail"] = detail
 
     def snapshot(self, since: int = 0) -> dict:
         with self._lock:
+            # A list, not a dict: jsonify sorts dict keys, which would hand the
+            # page the six steps in alphabetical order instead of run order.
+            steps = [dict(self.steps[k]) for k, _ in self.STEPS]
             return {"running": self.running, "done": self.done,
-                    "error": self.error, "step": self.step,
-                    "steps": json.loads(json.dumps(self.steps)),
+                    "error": self.error, "step": self.step, "steps": steps,
                     "cursor": len(self.lines), "lines": self.lines[since:]}
+
+
+# --------------------------------------------------------------------------- #
+# human-readable numbers
+# --------------------------------------------------------------------------- #
+def fmt_size(n: float) -> str:
+    n = float(n or 0)
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f} MB" if n < 1e8 else f"{n / 1e6:.0f} MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f} kB"
+    return f"{int(n)} B"
+
+
+def fmt_eta(seconds: float) -> str:
+    s = int(max(seconds or 0, 0))
+    if s >= 3600:
+        return f"{s // 3600}h {(s % 3600) // 60}m left"
+    if s >= 60:
+        return f"{s // 60}m {s % 60}s left"
+    return f"{s}s left" if s else "almost there"
+
+
+def fmt_transfer(got: float, total: float, speed: float, eta: float) -> str:
+    """One line of download state: how much, how fast, how much longer."""
+    bits = [f"{fmt_size(got)} of {fmt_size(total)}" if total
+            else f"{fmt_size(got)} so far"]
+    if speed > 0:
+        bits.append(f"{speed / 1e6:.1f} MB/s")
+    if total and speed > 0:
+        bits.append(fmt_eta(eta))
+    return " \u00b7 ".join(bits)
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +259,70 @@ class Progress:
 # --------------------------------------------------------------------------- #
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def _stream(cmd: list[str], on_line, cwd: str | None = None,
+            env: dict | None = None, should_cancel=None) -> int:
+    r"""Run `cmd` and hand every line of its output to `on_line` as it appears.
+
+    Splits on carriage returns as well as newlines: git writes its progress by
+    rewriting one line with \r, so a plain line iterator would hold all of it
+    back until the clone finished — which is exactly the silence this is meant
+    to fill. Reads with read1() so a partial block is delivered straight away.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, cwd=cwd, env=env)
+    assert proc.stdout
+    buf = b""
+    while True:
+        block = proc.stdout.read1(8192)
+        if not block:
+            break
+        buf += block
+        parts = re.split(rb"[\r\n]", buf)
+        buf = parts.pop()
+        for raw in parts:
+            text = raw.decode("utf-8", "replace").strip()
+            if text:
+                on_line(text)
+        if should_cancel and should_cancel():
+            proc.terminate()
+            break
+    if buf.strip():
+        on_line(buf.decode("utf-8", "replace").strip())
+    return proc.wait()
+
+
+# git reports each phase as its own 0-100%; "Receiving objects" is the download.
+GIT_PHASE = re.compile(r"(Counting objects|Compressing objects|Receiving objects"
+                       r"|Resolving deltas|Updating files):\s+(\d+)%")
+
+
+def git_run(cmd: list[str], log, on_pct=None,
+            should_cancel=None) -> tuple[int, str]:
+    """A git command with its progress forwarded. Returns (code, last output)."""
+    tail: list[str] = []
+
+    def line(text: str) -> None:
+        m = GIT_PHASE.search(text)
+        if m:
+            if on_pct:
+                on_pct(m.group(1), float(m.group(2)))
+            return
+        tail.append(text)
+        log(text[:200])
+
+    # C locale: the phase names below are what git prints in English, and a
+    # translated git would otherwise report no progress at all.
+    code = _stream(cmd, line, env=dict(os.environ, LC_ALL="C"),
+                   should_cancel=should_cancel)
+    return code, "\n".join(tail[-8:])
+
+
+def git_clone(url: str, target: Path, log, on_pct=None, depth: int = 1,
+              should_cancel=None) -> tuple[int, str]:
+    return git_run(["git", "clone", "--depth", str(depth), "--progress",
+                    url, str(target)], log, on_pct, should_cancel)
 
 
 def find_python(prog: Progress | None = None) -> str:
@@ -458,11 +572,16 @@ def comfy_online(url: str) -> bool:
         return False
 
 
-def wait_for_comfy(url: str, timeout: int = 900) -> bool:
-    deadline = time.time() + timeout
+def wait_for_comfy(url: str, timeout: int = 900, on_wait=None) -> bool:
+    """Poll until ComfyUI answers. `on_wait(elapsed, timeout)` runs each pass —
+    there is no percentage to give here, only how long it has been waiting."""
+    started = time.time()
+    deadline = started + timeout
     while time.time() < deadline:
         if comfy_online(url):
             return True
+        if on_wait:
+            on_wait(time.time() - started, timeout)
         time.sleep(2)
     return False
 
@@ -470,19 +589,76 @@ def wait_for_comfy(url: str, timeout: int = 900) -> bool:
 # --------------------------------------------------------------------------- #
 # pip
 # --------------------------------------------------------------------------- #
-def pip_install(python: str, args: list[str], log) -> None:
-    cmd = [python, "-m", "pip", "install"] + args
+# pip's own progress bar is a terminal animation and vanishes when its output
+# is a pipe, which is why a 2.4 GB torch wheel looks like a hang. `--progress-bar
+# raw` makes it print "Progress <done> of <total>" lines instead, which survive
+# the pipe. Older pips do not have it, so ask before using it.
+PIP_RAW = re.compile(r"^Progress (\d+) of (\d+)$")
+PIP_GET = re.compile(r"^\s*(?:Downloading|Using cached)\s+(\S+)")
+_PIP_RAW_OK: dict[str, bool] = {}
+
+
+def pip_has_raw_progress(python: str) -> bool:
+    if python not in _PIP_RAW_OK:
+        ok = False
+        try:
+            out = _run([python, "-m", "pip", "install", "--help"], timeout=60)
+            at = out.stdout.find("--progress-bar")
+            ok = at >= 0 and "raw" in out.stdout[at:at + 300]
+        except Exception:  # noqa: BLE001
+            ok = False
+        _PIP_RAW_OK[python] = ok
+    return _PIP_RAW_OK[python]
+
+
+def pip_install(python: str, args: list[str], log, on_pct=None,
+                should_cancel=None) -> None:
+    """Install with pip. `on_pct(pct|None, detail)` is called as it downloads."""
+    cmd = [python, "-m", "pip", "install"]
+    if on_pct and pip_has_raw_progress(python):
+        cmd += ["--progress-bar", "raw"]
+    cmd += args
     log("$ " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1)
-    assert proc.stdout
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line.startswith(("Collecting", "Downloading", "Installing",
+
+    # Per-wheel transfer state: pip restarts the counter for every file.
+    cur = {"name": "", "base": 0, "started": 0.0, "last": 0.0}
+
+    def line(text: str) -> None:
+        m = PIP_RAW.match(text)
+        if m:
+            if not on_pct:
+                return
+            got, total = int(m.group(1)), int(m.group(2))
+            now = time.time()
+            if got < cur["base"] or not cur["started"]:
+                cur["base"], cur["started"] = got, now       # a new file
+            if now - cur["last"] < 0.4 and not (total and got >= total):
+                return
+            cur["last"] = now
+            speed = (got - cur["base"]) / max(now - cur["started"], .1)
+            eta = (total - got) / speed if speed > 0 and total else 0
+            label = cur["name"] or "package"
+            on_pct((got / total * 100) if total else None,
+                   f"{label} — {fmt_transfer(got, total, speed, eta)}")
+            return
+        m = PIP_GET.match(text)
+        if m:
+            cur.update(name=unquote(m.group(1).rsplit("/", 1)[-1])[:60],
+                       base=0, started=0.0, last=0.0)
+        if text.startswith(("Collecting", "Downloading", "Installing",
                             "Successfully", "ERROR", "Building", "WARNING: ")):
-            log(line[:200])
-    if proc.wait() != 0:
+            log(text[:200])
+            if on_pct and text.startswith(("Installing", "Building")):
+                # Unpacking and byte-compiling: no byte count to report, and
+                # torch takes minutes over it, so say what is happening.
+                on_pct(None, text[:120])
+
+    if _stream(cmd, line, should_cancel=should_cancel) != 0:
         raise RuntimeError("pip install failed — see the log.")
+    if "pip" in args:
+        # pip just upgraded itself, so whether it can report progress may have
+        # changed. The very first install in a new venv is that upgrade.
+        _PIP_RAW_OK.pop(python, None)
 
 
 def torch_index(cfg: dict) -> str:
@@ -499,25 +675,58 @@ def torch_index(cfg: dict) -> str:
     return "https://download.pytorch.org/whl/cpu"
 
 
-def clone_node(node: dict, comfy_dir: Path, log) -> Path:
+def clone_node(node: dict, comfy_dir: Path, log, on_pct=None,
+               should_cancel=None) -> Path:
     """Clone or update one custom node, trying its fallback URL if given."""
     target = comfy_dir / "custom_nodes" / node["dir"]
     if target.exists():
         log(f"Updating {node['label']}")
-        _run(["git", "-C", str(target), "pull", "--ff-only"])
+        git_run(["git", "-C", str(target), "pull", "--ff-only", "--progress"],
+                log, on_pct, should_cancel)
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     urls = [node["repo"]] + ([node["fallback"]] if node.get("fallback") else [])
     errors = []
     for url in urls:
         log(f"git clone {url}")
-        res = _run(["git", "clone", "--depth", "1", url, str(target)])
-        if res.returncode == 0:
+        code, out = git_clone(url, target, log, on_pct,
+                              should_cancel=should_cancel)
+        if code == 0:
             return target
-        errors.append((res.stderr or res.stdout)[-300:])
+        errors.append(out[-300:])
         shutil.rmtree(target, ignore_errors=True)
+        if should_cancel and should_cancel():
+            raise RuntimeError("Cancelled.")
     raise RuntimeError(f"Could not download {node['label']}: "
                        + " | ".join(errors))
+
+
+# --------------------------------------------------------------------------- #
+# progress adapters
+# --------------------------------------------------------------------------- #
+# Each git phase is its own 0-100%, so stack them into one bar that only ever
+# moves forwards. Receiving objects is the transfer and takes nearly all of it.
+GIT_WEIGHT = {"Counting objects": (0.00, 0.02), "Compressing objects": (0.02, 0.03),
+              "Receiving objects": (0.05, 0.90), "Resolving deltas": (0.95, 0.04),
+              "Updating files": (0.95, 0.05)}
+
+
+def _git_pct(prog: Progress, key: str, head: str = "",
+             base: float = 0.0, span: float = 100.0):
+    """A git on_pct callback that drives `key`'s bar between base and base+span."""
+    def on_pct(phase: str, pct: float) -> None:
+        start, width = GIT_WEIGHT.get(phase, (0.0, 0.0))
+        line = f"{phase} — {pct:.0f}%"
+        prog.track(key, base + (start + width * pct / 100) * span,
+                   f"{head} · {line}" if head else line)
+    return on_pct
+
+
+def _pip_pct(prog: Progress, head: str, key: str = "deps"):
+    """A pip on_pct callback: pct is None while pip is not transferring bytes."""
+    def on_pct(pct: float | None, detail: str) -> None:
+        prog.track(key, pct, f"{head} · {detail}")
+    return on_pct
 
 
 # --------------------------------------------------------------------------- #
@@ -568,15 +777,15 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                             "Git is not installed, so ComfyUI cannot be "
                             "downloaded. Install Git from the Engine page, or "
                             "point Ideogram Studio at an existing ComfyUI.")
-                    prog.detail("comfyui", "Downloading ComfyUI…")
-                    res = _run(["git", "clone", "--depth", "1", COMFY_REPO,
-                                str(comfy_dir)])
-                    if res.returncode != 0:
-                        raise RuntimeError("git clone failed: " +
-                                           (res.stderr or res.stdout)[-600:])
+                    prog.track("comfyui", None, "Downloading ComfyUI…")
+                    code, out = git_clone(COMFY_REPO, comfy_dir, prog.log,
+                                          _git_pct(prog, "comfyui"))
+                    if code != 0:
+                        raise RuntimeError("git clone failed: " + out[-600:])
                 else:
-                    prog.detail("comfyui", "Updating ComfyUI…")
-                    _run(["git", "-C", str(comfy_dir), "pull", "--ff-only"])
+                    prog.track("comfyui", None, "Updating ComfyUI…")
+                    git_run(["git", "-C", str(comfy_dir), "pull", "--ff-only",
+                             "--progress"], prog.log, _git_pct(prog, "comfyui"))
             if not (comfy_dir / "main.py").exists():
                 raise RuntimeError(f"No main.py in {comfy_dir} — that folder is "
                                    "not a ComfyUI install.")
@@ -594,14 +803,17 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
         else:
             if not have_git():
                 raise RuntimeError("Git is needed to install the custom nodes.")
-            for node in CUSTOM_NODES:
-                if node["id"] == "manager" and not cfg.get("want_manager", True):
-                    continue
-                prog.detail("nodes", f"Installing {node['label']}…")
-                node_paths.append(clone_node(node, comfy_dir, prog.log))
-            prog.finish("nodes", ", ".join(n["label"] for n in CUSTOM_NODES
-                                           if n["id"] != "manager"
-                                           or cfg.get("want_manager", True)))
+            wanted = [n for n in CUSTOM_NODES
+                      if n["id"] != "manager" or cfg.get("want_manager", True)]
+            for i, node in enumerate(wanted, 1):
+                head = f"{node['label']} ({i} of {len(wanted)})"
+                prog.track("nodes", (i - 1) / len(wanted) * 100,
+                           f"Installing {head}…")
+                node_paths.append(clone_node(
+                    node, comfy_dir, prog.log,
+                    _git_pct(prog, "nodes", head, (i - 1) / len(wanted) * 100,
+                             1 / len(wanted) * 100)))
+            prog.finish("nodes", ", ".join(n["label"] for n in wanted))
 
         # 4. dependencies --------------------------------------------------- #
         prog.begin("deps")
@@ -621,23 +833,28 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                         raise RuntimeError("venv creation failed: " +
                                            (res.stderr or res.stdout)[-600:])
                 target = vpy
-                prog.detail("deps", "Installing PyTorch — the long one…")
-                pip_install(str(target), ["--upgrade", "pip", "wheel"], prog.log)
+                prog.track("deps", None, "Updating pip…")
+                pip_install(str(target), ["--upgrade", "pip", "wheel"],
+                            prog.log, _pip_pct(prog, "pip and wheel"))
                 args = ["torch", "torchvision"]
                 idx = torch_index(cfg)
                 if idx:
                     args += ["--index-url", idx]
-                pip_install(str(target), args, prog.log)
-                prog.detail("deps", "Installing ComfyUI requirements…")
+                prog.track("deps", None, "Installing PyTorch — the long one…")
+                pip_install(str(target), args, prog.log,
+                            _pip_pct(prog, "PyTorch"))
+                prog.track("deps", None, "Installing ComfyUI requirements…")
                 pip_install(str(target),
                             ["-r", str(Path(cfg["comfy_dir"]) / "requirements.txt")],
-                            prog.log)
+                            prog.log, _pip_pct(prog, "ComfyUI requirements"))
             cfg["python"] = str(target)
             for path in node_paths:
                 reqs = path / "requirements.txt"
                 if reqs.exists():
-                    prog.detail("deps", f"Installing requirements for {path.name}…")
-                    pip_install(str(target), ["-r", str(reqs)], prog.log)
+                    prog.track("deps", None,
+                               f"Installing requirements for {path.name}…")
+                    pip_install(str(target), ["-r", str(reqs)], prog.log,
+                                _pip_pct(prog, path.name))
                 else:
                     prog.log(f"No requirements.txt in {path.name} — skipping.")
             prog.finish("deps", f"Installed into {Path(cfg['python']).name}")
@@ -648,21 +865,46 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
         if not todo:
             prog.finish("models", "Everything is already downloaded")
         else:
-            prog.log(f"{len(todo)} file(s) to download "
-                     f"({cfg.get('precision', 'fp8')} weights)")
+            repo = cfg.get("hf_repo") or MODEL_REPO
+            # Ask the repo for the real sizes so the bar can cover the whole
+            # set. The hard-coded sizes are rough and some are zero, and a bar
+            # that only knows the current file jumps back to 0% four times.
+            sizes: dict[str, int] = {}
+            try:
+                prog.track("models", None, "Checking what is on the repo…")
+                sizes = {f["path"]: f["size"] for f in hf_tree(cfg, repo)}
+            except Exception as exc:  # noqa: BLE001
+                prog.log(f"Could not read the file list ({exc}). The bar will "
+                         "follow one file at a time instead of the whole set.")
+            plan = []
             for item in todo:
+                path = f"{item['folder']}/{item['name']}"
+                plan.append((item, path,
+                             int(sizes.get(path) or item.get("size") or 0)))
+            grand = sum(s for _, _, s in plan)
+            prog.log(f"{len(plan)} file(s) to download "
+                     f"({cfg.get('precision', 'fp8')} weights"
+                     + (f", {fmt_size(grand)}" if grand else "") + ")")
+            done_bytes = 0
+            for i, (item, path, size) in enumerate(plan, 1):
                 dest = model_path(models_dir, item)
+                head = f"{item['name']} ({i} of {len(plan)})"
 
-                def on_prog(got, total, speed, eta, _n=item["name"]):
-                    prog.detail("models",
-                                f"{_n} — {got/1e9:.2f} of {total/1e9:.2f} GB · "
-                                f"{speed/1e6:.1f} MB/s · "
-                                f"{int(eta//60)}m {int(eta%60)}s left")
+                def on_prog(got, total, speed, eta, _head=head):
+                    whole = ((done_bytes + got) / grand * 100) if grand else (
+                        (got / total * 100) if total else None)
+                    prog.track("models", whole,
+                               f"{_head} — "
+                               + fmt_transfer(got, total, speed, eta))
 
-                download_file(cfg, cfg.get("hf_repo") or MODEL_REPO,
-                              f"{item['folder']}/{item['name']}", dest, on_prog)
+                prog.track("models",
+                           (done_bytes / grand * 100) if grand else None,
+                           f"{head} — starting…")
+                download_file(cfg, repo, path, dest, on_prog)
+                done_bytes += size or (dest.stat().st_size if dest.exists() else 0)
                 prog.log(f"Downloaded {item['name']}")
-            prog.finish("models", "Weights ready")
+            prog.finish("models", f"{len(plan)} file(s) ready"
+                        + (f" · {fmt_size(grand)}" if grand else ""))
 
         # 6. launch --------------------------------------------------------- #
         prog.begin("launch")
@@ -676,8 +918,15 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
         else:
             port = int(url.rsplit(":", 1)[-1])
             comfy.start(cfg["python"], Path(cfg["comfy_dir"]), port, prog)
-            prog.detail("launch", "Waiting for ComfyUI — the first start is slow…")
-            if not wait_for_comfy(url, timeout=900):
+
+            def waiting(elapsed: float, limit: int) -> None:
+                s = int(elapsed)
+                been = f"{s // 60}m {s % 60}s" if s >= 60 else f"{s}s"
+                prog.track("launch", None, "Waiting for ComfyUI — "
+                           f"{been} so far. The first start is slow.")
+
+            prog.track("launch", None, "Waiting for ComfyUI…")
+            if not wait_for_comfy(url, timeout=900, on_wait=waiting):
                 raise RuntimeError("ComfyUI did not start within 15 minutes.\n"
                                    + "\n".join(comfy.tail(25)))
         prog.finish("launch", url)
