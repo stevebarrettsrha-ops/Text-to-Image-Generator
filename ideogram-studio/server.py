@@ -286,6 +286,9 @@ def api_status():
         missing = [m["name"] for m in bootstrap.missing_models(models_dir, cfg)]
     payload = {
         "comfy_online": online,
+        # Alive but not answering yet is "starting", not "offline" — the first
+        # start loads PyTorch and the models, which takes minutes.
+        "comfy_running_managed": comfy_proc.alive(),
         "setup_complete": bool(cfg.get("setup_complete")),
         "missing_models": missing,
         "detected": detect_comfy_dirs(),
@@ -340,8 +343,15 @@ def api_setup_state():
 def api_comfy_start():
     if comfy_online(cfg["comfy_url"]):
         return jsonify({"ok": True, "already": True})
+    if comfy_proc.alive():
+        return jsonify({"ok": True, "starting": True})
     py = bootstrap.comfy_python(cfg)
     if not cfg.get("comfy_dir") or not py:
+        if cfg.get("comfy_dir") and not cfg.get("managed", True):
+            return jsonify({"error": "Ideogram Studio does not know which "
+                            "Python that ComfyUI runs on, so it will not start "
+                            "it. Start ComfyUI yourself, then press "
+                            "Recheck."}), 400
         return jsonify({"error": "Run setup first."}), 400
     comfy_proc.start(py, Path(cfg["comfy_dir"]),
                      int(cfg["comfy_url"].rsplit(":", 1)[-1]), progress)
@@ -366,7 +376,8 @@ def api_config():
 @app.get("/api/deps")
 def api_deps():
     live = client if comfy_online(cfg["comfy_url"]) else None
-    return jsonify({"items": manager.dependencies(cfg, live),
+    return jsonify({"items": manager.dependencies(cfg, live,
+                                                  starting=comfy_proc.alive()),
                     "torch_index": cfg.get("torch_index", "")})
 
 
