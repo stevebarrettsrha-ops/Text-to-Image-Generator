@@ -113,6 +113,10 @@ fake 0%. Sources of a real number:
   for the real sizes first. Falling back to per-file percentages is fine; a bar
   that restarts four times is not.
 
+Generation tiles follow the same rule: while ComfyUI loads weights there is
+no step count, so the job carries `vague: true` and the tile shows elapsed time
+and an indeterminate bar — never a percentage pinned at 12%.
+
 `snapshot()` sends the steps as an **ordered list**, not a dict: Flask sorts JSON
 object keys, which served them alphabetically and put "Check Python" last.
 `app.json.sort_keys = False` covers the rest of the API.

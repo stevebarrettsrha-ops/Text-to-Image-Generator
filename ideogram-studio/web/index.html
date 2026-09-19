@@ -1064,12 +1064,17 @@ function skeleton(job) {
   var el = document.createElement("div");
   el.className = "skel" + (job.status === "error" ? " bad" : "");
   var pct = Math.round(job.pct || 0);
+  // vague means the number is a guess (the engine is loading weights, with no
+  // step count yet), so show a moving bar and no percentage rather than a bar
+  // frozen at 12% — which reads as "hung".
+  var vague = !!job.vague && job.status !== "error";
   el.innerHTML = '<div class="ph" style="aspect-ratio:' + d.w + "/" + d.h + '"></div>' +
     '<div class="lbl"><span>' + esc(job.status === "error"
       ? (job.error || "Failed") : (job.stage || "Working…")) + "</span><span>" +
-    (job.status === "error" ? "" : pct + "%") + "</span></div>" +
+    (job.status === "error" || vague ? "" : pct + "%") + "</span></div>" +
     (job.status === "error" ? "" :
-      '<div class="bar4"><i style="width:' + pct + '%"></i></div>');
+      vague ? '<div class="bar4 indet"><i></i></div>'
+            : '<div class="bar4"><i style="width:' + pct + '%"></i></div>');
   if (job.status === "running") {
     var b = document.createElement("button");
     b.className = "btn thin";
