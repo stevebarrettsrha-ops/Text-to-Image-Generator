@@ -68,6 +68,19 @@ fills:
   builds took that JSON on `bboxes` as a string, so the shape in `/object_info`
   decides which one to use, never a version number.
 
+## Reference images (img2img)
+
+A reference is a **starting latent**, nothing more: `LoadImage → ImageScale
+(centre-crop to the requested size, never stretched) → VAEEncode` through the
+same Flux 2 VAE that decodes the result, and the Repaint slider is
+`BasicScheduler.denoise`. Batches repeat the latent with `RepeatLatentBatch`.
+Those nodes are required only when a reference is used, and each missing one
+fails loudly with its name. This is not style or identity reference — the open
+Ideogram 4 release has no node path for that, so the UI says "starting point"
+and nothing grander. The upload lives in ComfyUI's input folder (via
+`/upload/image`), which is why setting a reference needs the engine up, and why
+previews are proxied back out through `/api/ref-preview` → ComfyUI `/view`.
+
 ## Graceful degradation
 
 Without KJNodes there is no `Ideogram4PromptBuilderKJ`, so `build()` falls back to

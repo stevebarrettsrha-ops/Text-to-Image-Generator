@@ -318,6 +318,12 @@
         border-radius:12px;border:1px solid var(--line);background:var(--raised);
         cursor:pointer}
   .pick label:has(input:checked){border-color:var(--accent);background:rgba(124,77,255,.09)}
+  .refdrop{border:1.5px dashed var(--line);border-radius:12px;min-height:96px;
+        display:grid;place-items:center;cursor:pointer;padding:12px;
+        color:var(--dim);font-size:12.5px;text-align:center}
+  .refdrop.has{border-style:solid;padding:6px}
+  .refdrop.drag{border-color:var(--accent);color:#cdbcff}
+  .refdrop img{max-width:100%;max-height:190px;border-radius:9px;display:block}
   .pick input{margin-top:3px;accent-color:var(--accent);width:auto}
   .pick b{display:block;font-size:13.5px}
   .pick em{font-style:normal;font-size:12.5px;color:var(--muted);display:block;
@@ -420,6 +426,9 @@
             <button class="pill" id="btnLayout">
               <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
               <span id="layoutLabel">Layout</span></button>
+            <button class="pill" id="btnRef">
+              <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 15 5-5 4 4 3-3 6 6"/><circle cx="9" cy="9" r="1.6"/></svg>
+              <span id="refLabel">Reference</span></button>
             <button class="pill" id="btnLoras">
               <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg>
               <span id="loraLabel">LoRAs</span></button>
@@ -577,6 +586,27 @@
 </div>
 
 <!-- lora popover -->
+<div class="pop" id="refPop" hidden style="width:min(420px,94vw)">
+  <h3>Reference image</h3>
+  <p class="note" style="margin:0 0 10px">Generation starts from this picture, so the
+    result keeps its layout and colours. It is a starting point, not a style or
+    face reference.</p>
+  <div class="refdrop" id="refDrop" tabindex="0" role="button"
+       aria-label="Choose a reference image">
+    <input type="file" id="refFile" accept="image/png,image/jpeg,image/webp" hidden>
+    <span id="refDropHint">Click to choose an image, or drop one here</span>
+    <img id="refThumb" alt="Reference preview" hidden>
+  </div>
+  <div class="orow"><span class="lab">Repaint</span><div class="ctl"><div class="slider">
+    <input type="range" id="ref-sl" min="20" max="95" step="5" value="60">
+    <span class="v" id="refVal">60%</span></div></div></div>
+  <p class="note">Low keeps the reference almost as it is; high only borrows its rough
+    composition. The engine has to be running to receive the file.</p>
+  <div class="rowbtn">
+    <button class="btn thin" id="btnRefClear">Remove</button>
+    <button class="btn thin" id="btnRefDone">Done</button>
+  </div>
+</div>
 <div class="pop" id="loraPop" hidden style="width:min(480px,94vw)">
   <h3>LoRAs</h3>
   <div id="loraPick"></div>
@@ -625,6 +655,7 @@
     <div class="lbacts">
       <button class="btn go" id="lbReuse">Reuse settings</button>
       <button class="btn" id="lbVary">Vary</button>
+      <button class="btn" id="lbAsRef">Use as reference</button>
       <button class="btn" id="lbDownload">Download</button>
       <button class="btn" id="lbDelete">Delete</button>
       <button class="btn" id="lbClose">Close</button>
@@ -698,7 +729,7 @@
 /* ========================= state ========================= */
 var S = {
   view: "home", ratio: "3:4", mp: 1, regions: [], sel: -1,
-  engineFlags: { status: false, deps: false }, lbReturn: null,
+  engineFlags: { status: false, deps: false }, lbReturn: null, ref: null,
   status: null, jobs: [], images: [], libFilter: "", batch: 1,
   setupCursor: 0, taskId: null, taskCursor: 0, setupSeen: false, lightbox: null,
   loras: [], loraPick: {}
@@ -755,6 +786,46 @@ function syncSize() {
   cv.style.width = Math.round(d.w * scale) + "px";
   cv.style.height = Math.round(d.h * scale) + "px";
   saveDraft();
+}
+
+/* ========================= reference image ========================= */
+function refSync() {
+  $("btnRef").classList.toggle("on", !!S.ref);
+  $("refLabel").textContent = S.ref
+    ? "Reference \u00b7 " + $("ref-sl").value + "%" : "Reference";
+  $("refVal").textContent = $("ref-sl").value + "%";
+  $("refThumb").hidden = !S.ref;
+  $("refDropHint").hidden = !!S.ref;
+  $("refDrop").classList.toggle("has", !!S.ref);
+}
+function setRef(name) {
+  S.ref = { name: name };
+  // cache-bust: re-using the same file name must show the new picture
+  $("refThumb").src = "/api/ref-preview?name=" + encodeURIComponent(name) +
+    "&t=" + Date.now();
+  refSync();
+}
+function clearRef() {
+  S.ref = null;
+  $("refThumb").removeAttribute("src");
+  $("refFile").value = "";
+  refSync();
+}
+async function uploadRef(file) {
+  if (!file) return;
+  if (!/^image\//.test(file.type)) { toast("That is not an image file.", true); return; }
+  $("refDropHint").textContent = "Sending to the engine\u2026";
+  try {
+    var fd = new FormData();
+    fd.append("file", file);
+    var r = await api("/api/upload-image", { method: "POST", body: fd });
+    setRef(r.name);
+    toast("Reference set \u2014 " + $("ref-sl").value + "% repaint.");
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    $("refDropHint").textContent = "Click to choose an image, or drop one here";
+  }
 }
 
 /* ========================= regions ========================= */
@@ -946,6 +1017,7 @@ function closePops() {
   $("settingsPop").hidden = true;
   $("layoutPop").hidden = true;
   $("loraPop").hidden = true;
+  $("refPop").hidden = true;
 }
 function placePop(pop, anchor) {
   pop.hidden = false;
@@ -987,6 +1059,10 @@ function collect() {
   p.loras = Object.keys(S.loraPick).filter(function (n) {
     return S.loraPick[n].on; }).map(function (n) {
     return { name: n, strength: S.loraPick[n].strength }; });
+  if (S.ref) {
+    p.ref_image = S.ref.name;
+    p.ref_denoise = Number($("ref-sl").value) / 100;
+  }
   var seed = $("seed").value.trim();
   p.seed = seed ? Number(seed) : null;
   return p;
@@ -1184,6 +1260,13 @@ function reuse(im) {
     else gone.push(l.name.replace(/\.safetensors$/, ""));
   });
   renderLoraPick();
+  if (im.ref_image) {
+    setRef(im.ref_image);
+    if (im.ref_denoise) $("ref-sl").value = Math.round(im.ref_denoise * 100);
+    refSync();
+  } else {
+    clearRef();
+  }
   S.sel = -1;
   $("regEditor").hidden = true;
   closeLightbox();
@@ -1222,6 +1305,8 @@ function openLightbox(im) {
   ["style", "style_photo", "lighting", "medium", "background", "aesthetics"]
     .forEach(function (f) { if (im[f]) rows.push([f.replace("_", " "), im[f]]); });
   if ((im.regions || []).length) rows.push(["Regions", im.regions.length]);
+  if (im.ref_image) rows.push(["Reference",
+    (im.ref_denoise ? Math.round(im.ref_denoise * 100) + "% repaint" : "used")]);
   if (im.builder === false) rows.push(["Prompt builder", "not used"]);
   $("lbMeta").innerHTML = rows.map(function (r) {
     return '<div class="kv"><span>' + esc(r[0]) + "</span><b>" + esc(r[1]) + "</b></div>";
@@ -1945,6 +2030,43 @@ function wire() {
     if (!open) { loadLoras(); placePop(pop, $("btnLoras")); }
   });
   $("btnCloseLoras").addEventListener("click", closePops);
+  $("btnRef").addEventListener("click", function () {
+    var pop = $("refPop");
+    var open = !pop.hidden;
+    closePops();
+    if (!open) { refSync(); placePop(pop, $("btnRef")); }
+  });
+  $("btnRefDone").addEventListener("click", closePops);
+  $("btnRefClear").addEventListener("click", function () {
+    clearRef(); toast("Reference removed.");
+  });
+  $("ref-sl").addEventListener("input", refSync);
+  var drop = $("refDrop");
+  drop.addEventListener("click", function () { $("refFile").click(); });
+  drop.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); $("refFile").click(); }
+  });
+  $("refFile").addEventListener("change", function () {
+    uploadRef($("refFile").files[0]);
+  });
+  ["dragover", "dragenter"].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) {
+      e.preventDefault(); drop.classList.add("drag"); });
+  });
+  ["dragleave", "drop"].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) {
+      e.preventDefault(); drop.classList.remove("drag"); });
+  });
+  drop.addEventListener("drop", function (e) {
+    uploadRef(e.dataTransfer.files && e.dataTransfer.files[0]);
+  });
+  $("refThumb").addEventListener("error", function () {
+    if (!S.ref) return;
+    $("refThumb").hidden = true;
+    $("refDropHint").hidden = false;
+    $("refDropHint").textContent = "The engine no longer has this picture \u2014 " +
+      "choose it again.";
+  });
   $("btnBrowseLoras").addEventListener("click", function () {
     closePops(); show("models"); });
   $("btnCloseSettings").addEventListener("click", closePops);
@@ -1952,7 +2074,7 @@ function wire() {
   // Each popover and the button that toggles it. A click inside either is
   // the popover's own business; anything else closes it.
   var POPS = { settingsPop: "btnSettings", layoutPop: "btnLayout",
-               loraPop: "btnLoras" };
+               loraPop: "btnLoras", refPop: "btnRef" };
   document.addEventListener("pointerdown", function (e) {
     Object.keys(POPS).forEach(function (id) {
       var pop = $(id);
@@ -2022,6 +2144,17 @@ function wire() {
     if (S.lightbox) window.open("/api/image/" + S.lightbox.id, "_blank"); });
   $("lbDelete").addEventListener("click", function () {
     if (S.lightbox) removeImage(S.lightbox); });
+  $("lbAsRef").addEventListener("click", async function () {
+    if (!S.lightbox) return;
+    try {
+      var r = await api("/api/image/" + S.lightbox.id + "/as-reference",
+                        { method: "POST" });
+      setRef(r.name);
+      closeLightbox();
+      show("create");
+      toast("Set as the reference \u2014 it is on the Reference pill.");
+    } catch (e) { toast(e.message, true); }
+  });
   $("lbVary").addEventListener("click", function () {
     if (!S.lightbox) return;
     reuse(S.lightbox);

@@ -355,6 +355,56 @@ class ComfyClient:
         node["inputs"].update(extra)
         return node
 
+    def _reference_latent(self, g: dict, name: str, width: int, height: int,
+                          batch: int) -> list:
+        """img2img: the reference picture becomes the starting latent.
+
+        Scaled to the requested size (centre-cropped, never stretched), then
+        encoded through the same VAE that decodes the result. How much of it
+        survives is the scheduler's denoise — low repaint keeps its layout and
+        colours, 100% ignores it entirely. This is a starting point, not a
+        style or identity reference; the open Ideogram 4 release has no node
+        path for that.
+        """
+        for cls in ("LoadImage", "ImageScale", "VAEEncode"):
+            if not self.has(cls):
+                raise ComfyError(
+                    f"This ComfyUI has no {cls} node, so a reference image "
+                    "cannot be used. Update ComfyUI from the Engine page.")
+        g["20"] = self._node("LoadImage", {
+            "image": {"names": ["image"], "value": name, "required": True},
+        })
+        scale_spec = self.node_inputs("ImageScale")
+        methods = self._choices(scale_spec.get("upscale_method"))
+        crops = self._choices(scale_spec.get("crop"))
+        g["21"] = self._node("ImageScale", {
+            "image": {"names": ["image"], "value": ["20", 0], "required": True},
+            "method": {"names": ["upscale_method"],
+                       "value": "lanczos" if "lanczos" in methods
+                       else (methods[0] if methods else "nearest-exact")},
+            "width": {"names": ["width"], "value": width, "required": True},
+            "height": {"names": ["height"], "value": height, "required": True},
+            "crop": {"names": ["crop"],
+                     "value": "center" if "center" in crops
+                     else (crops[0] if crops else "disabled")},
+        })
+        g["22"] = self._node("VAEEncode", {
+            "pixels": {"names": ["pixels"], "value": ["21", 0], "required": True},
+            "vae": {"names": ["vae"], "value": ["4", 0], "required": True},
+        })
+        if batch <= 1:
+            return ["22", 0]
+        if not self.has("RepeatLatentBatch"):
+            raise ComfyError(
+                "This ComfyUI has no RepeatLatentBatch node, so a reference "
+                "image can only make one image at a time. Set the batch to "
+                "×1, or update ComfyUI from the Engine page.")
+        g["23"] = self._node("RepeatLatentBatch", {
+            "samples": {"names": ["samples"], "value": ["22", 0], "required": True},
+            "amount": {"names": ["amount"], "value": batch},
+        })
+        return ["23", 0]
+
     def build(self, p: dict) -> dict:
         """p: description, background, style, style_photo, aesthetics, lighting,
         medium, regions[], width, height, batch, steps, cfg, guider_cfg, shift,
@@ -478,28 +528,41 @@ class ComfyClient:
             "sampler": {"names": ["sampler_name"], "value": p.get("sampler") or "euler",
                         "required": True},
         })
+        # With a reference image the denoise is the repaint amount — how much
+        # of the encoded picture the sampler is allowed to redo.
+        ref = (p.get("ref_image") or "").strip()
+        denoise = float(p.get("denoise") or 1.0)
+        if ref:
+            denoise = min(max(float(p.get("ref_denoise") or 0.6), 0.05), 1.0)
+
         g["13"] = self._node("BasicScheduler", {
             "model": {"names": ["model"], "value": sched_model, "required": True},
             "scheduler": {"names": ["scheduler"], "value": p.get("scheduler") or "simple"},
             "steps": {"names": ["steps"], "value": int(p.get("steps") or 28)},
-            "denoise": {"names": ["denoise"], "value": float(p.get("denoise") or 1.0)},
+            "denoise": {"names": ["denoise"], "value": denoise},
         })
 
-        latent_class = "EmptyFlux2LatentImage" if self.has("EmptyFlux2LatentImage") \
-            else "EmptySD3LatentImage" if self.has("EmptySD3LatentImage") \
-            else "EmptyLatentImage"
-        g["14"] = self._node(latent_class, {
-            "width": {"names": ["width"], "value": width, "required": True},
-            "height": {"names": ["height"], "value": height, "required": True},
-            "batch": {"names": ["batch_size"], "value": int(p.get("batch") or 1)},
-        })
+        if ref:
+            latent_class = "VAEEncode"
+            latent_ref = self._reference_latent(g, ref, width, height,
+                                                int(p.get("batch") or 1))
+        else:
+            latent_class = "EmptyFlux2LatentImage" if self.has("EmptyFlux2LatentImage") \
+                else "EmptySD3LatentImage" if self.has("EmptySD3LatentImage") \
+                else "EmptyLatentImage"
+            g["14"] = self._node(latent_class, {
+                "width": {"names": ["width"], "value": width, "required": True},
+                "height": {"names": ["height"], "value": height, "required": True},
+                "batch": {"names": ["batch_size"], "value": int(p.get("batch") or 1)},
+            })
+            latent_ref = ["14", 0]
 
         g["15"] = self._node("SamplerCustomAdvanced", {
             "noise": {"names": ["noise"], "value": ["11", 0], "required": True},
             "guider": {"names": ["guider"], "value": ["10", 0], "required": True},
             "sampler": {"names": ["sampler"], "value": ["12", 0], "required": True},
             "sigmas": {"names": ["sigmas"], "value": ["13", 0], "required": True},
-            "latent": {"names": ["latent_image"], "value": ["14", 0], "required": True},
+            "latent": {"names": ["latent_image"], "value": latent_ref, "required": True},
         })
         g["16"] = self._node("VAEDecode", {
             "samples": {"names": ["samples"], "value": ["15", 0], "required": True},
@@ -511,7 +574,7 @@ class ComfyClient:
         })
 
         return {"prompt": g, "seed": seed, "files": files, "latent": latent_class,
-                "loras": loras,
+                "loras": loras, "ref": ref, "ref_denoise": denoise if ref else None,
                 "builder": self.has(PROMPT_BUILDER) and p.get("use_builder", True)}
 
     # ------------------------------------------------------------------ #
