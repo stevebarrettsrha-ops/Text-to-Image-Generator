@@ -96,7 +96,10 @@ Everything else hangs off the bar:
 Hover any image for reuse, download and delete. Click it for the full view, with
 the prompt and every setting listed down the side — **Reuse settings** loads it
 all back into the bar, **Vary** does the same but clears the seed and fires a new
-run straight away.
+run straight away, and **Edit** opens the picture with a brush: paint over what
+should change, press **Edit this**, describe the change, and only the painted
+area is regenerated — the rest stays exactly as it was. The Reference pill shows
+**Edit · 90%** while an edit is loaded.
 
 `Ctrl` + `Enter` generates from anywhere.
 

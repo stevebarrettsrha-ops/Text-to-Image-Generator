@@ -355,18 +355,26 @@ class ComfyClient:
         node["inputs"].update(extra)
         return node
 
-    def _reference_latent(self, g: dict, name: str, width: int, height: int,
-                          batch: int) -> list:
+    def _reference_latent(self, g: dict, name: str, mask: str, width: int,
+                          height: int, batch: int) -> list:
         """img2img: the reference picture becomes the starting latent.
 
-        Scaled to the requested size (centre-cropped, never stretched), then
-        encoded through the same VAE that decodes the result. How much of it
-        survives is the scheduler's denoise — low repaint keeps its layout and
-        colours, 100% ignores it entirely. This is a starting point, not a
-        style or identity reference; the open Ideogram 4 release has no node
-        path for that.
+        Plain reference: scaled to the requested size (centre-cropped, never
+        stretched), then encoded through the same VAE that decodes the result;
+        the scheduler's denoise is how much of it the sampler may redo.
+
+        With a mask it is an edit: the picture keeps its own size (the page
+        painted the mask at exactly those pixels), and SetLatentNoiseMask
+        confines the repaint to the painted area — everything else survives
+        untouched. The mask arrives as its own opaque black/white image because
+        a canvas export cannot keep colour under transparent pixels.
+
+        Neither is a style or identity reference; the open Ideogram 4 release
+        has no node path for that.
         """
-        for cls in ("LoadImage", "ImageScale", "VAEEncode"):
+        need = ["LoadImage", "VAEEncode"] + (
+            ["ImageToMask", "SetLatentNoiseMask"] if mask else ["ImageScale"])
+        for cls in need:
             if not self.has(cls):
                 raise ComfyError(
                     f"This ComfyUI has no {cls} node, so a reference image "
@@ -374,36 +382,59 @@ class ComfyClient:
         g["20"] = self._node("LoadImage", {
             "image": {"names": ["image"], "value": name, "required": True},
         })
-        scale_spec = self.node_inputs("ImageScale")
-        methods = self._choices(scale_spec.get("upscale_method"))
-        crops = self._choices(scale_spec.get("crop"))
-        g["21"] = self._node("ImageScale", {
-            "image": {"names": ["image"], "value": ["20", 0], "required": True},
-            "method": {"names": ["upscale_method"],
-                       "value": "lanczos" if "lanczos" in methods
-                       else (methods[0] if methods else "nearest-exact")},
-            "width": {"names": ["width"], "value": width, "required": True},
-            "height": {"names": ["height"], "value": height, "required": True},
-            "crop": {"names": ["crop"],
-                     "value": "center" if "center" in crops
-                     else (crops[0] if crops else "disabled")},
-        })
+        if mask:
+            pixels = ["20", 0]
+        else:
+            scale_spec = self.node_inputs("ImageScale")
+            methods = self._choices(scale_spec.get("upscale_method"))
+            crops = self._choices(scale_spec.get("crop"))
+            g["21"] = self._node("ImageScale", {
+                "image": {"names": ["image"], "value": ["20", 0], "required": True},
+                "method": {"names": ["upscale_method"],
+                           "value": "lanczos" if "lanczos" in methods
+                           else (methods[0] if methods else "nearest-exact")},
+                "width": {"names": ["width"], "value": width, "required": True},
+                "height": {"names": ["height"], "value": height, "required": True},
+                "crop": {"names": ["crop"],
+                         "value": "center" if "center" in crops
+                         else (crops[0] if crops else "disabled")},
+            })
+            pixels = ["21", 0]
         g["22"] = self._node("VAEEncode", {
-            "pixels": {"names": ["pixels"], "value": ["21", 0], "required": True},
+            "pixels": {"names": ["pixels"], "value": pixels, "required": True},
             "vae": {"names": ["vae"], "value": ["4", 0], "required": True},
         })
-        if batch <= 1:
-            return ["22", 0]
-        if not self.has("RepeatLatentBatch"):
-            raise ComfyError(
-                "This ComfyUI has no RepeatLatentBatch node, so a reference "
-                "image can only make one image at a time. Set the batch to "
-                "×1, or update ComfyUI from the Engine page.")
-        g["23"] = self._node("RepeatLatentBatch", {
-            "samples": {"names": ["samples"], "value": ["22", 0], "required": True},
-            "amount": {"names": ["amount"], "value": batch},
-        })
-        return ["23", 0]
+        out = ["22", 0]
+        if batch > 1:
+            if not self.has("RepeatLatentBatch"):
+                raise ComfyError(
+                    "This ComfyUI has no RepeatLatentBatch node, so a reference "
+                    "image can only make one image at a time. Set the batch to "
+                    "×1, or update ComfyUI from the Engine page.")
+            g["23"] = self._node("RepeatLatentBatch", {
+                "samples": {"names": ["samples"], "value": out, "required": True},
+                "amount": {"names": ["amount"], "value": batch},
+            })
+            out = ["23", 0]
+        if mask:
+            g["24"] = self._node("LoadImage", {
+                "image": {"names": ["image"], "value": mask, "required": True},
+            })
+            channels = self._choices(self.node_inputs("ImageToMask").get("channel"))
+            g["25"] = self._node("ImageToMask", {
+                "image": {"names": ["image"], "value": ["24", 0], "required": True},
+                "channel": {"names": ["channel"],
+                            "value": "red" if "red" in channels
+                            else (channels[0] if channels else "red")},
+            })
+            # After the batch repeat: a [1, h, w] mask broadcasts across the
+            # batch, and repeating first would lose it from the latent dict.
+            g["26"] = self._node("SetLatentNoiseMask", {
+                "samples": {"names": ["samples"], "value": out, "required": True},
+                "mask": {"names": ["mask"], "value": ["25", 0], "required": True},
+            })
+            out = ["26", 0]
+        return out
 
     def build(self, p: dict) -> dict:
         """p: description, background, style, style_photo, aesthetics, lighting,
@@ -531,6 +562,7 @@ class ComfyClient:
         # With a reference image the denoise is the repaint amount — how much
         # of the encoded picture the sampler is allowed to redo.
         ref = (p.get("ref_image") or "").strip()
+        mask = (p.get("ref_mask") or "").strip()
         denoise = float(p.get("denoise") or 1.0)
         if ref:
             denoise = min(max(float(p.get("ref_denoise") or 0.6), 0.05), 1.0)
@@ -544,7 +576,7 @@ class ComfyClient:
 
         if ref:
             latent_class = "VAEEncode"
-            latent_ref = self._reference_latent(g, ref, width, height,
+            latent_ref = self._reference_latent(g, ref, mask, width, height,
                                                 int(p.get("batch") or 1))
         else:
             latent_class = "EmptyFlux2LatentImage" if self.has("EmptyFlux2LatentImage") \
@@ -574,7 +606,8 @@ class ComfyClient:
         })
 
         return {"prompt": g, "seed": seed, "files": files, "latent": latent_class,
-                "loras": loras, "ref": ref, "ref_denoise": denoise if ref else None,
+                "loras": loras, "ref": ref, "ref_mask": mask,
+                "ref_denoise": denoise if ref else None,
                 "builder": self.has(PROMPT_BUILDER) and p.get("use_builder", True)}
 
     # ------------------------------------------------------------------ #

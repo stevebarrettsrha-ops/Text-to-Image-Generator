@@ -246,6 +246,7 @@ def run_job(job_id: str, params: dict) -> None:
                 "medium": params.get("medium", ""),
                 "regions": params.get("regions") or [],
                 "ref_image": params.get("ref_image") or "",
+                "ref_mask": params.get("ref_mask") or "",
                 "ref_denoise": built.get("ref_denoise"),
                 "width": params.get("width"), "height": params.get("height"),
                 "steps": params.get("steps"), "cfg": params.get("cfg"),

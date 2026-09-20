@@ -324,6 +324,20 @@
   .refdrop.has{border-style:solid;padding:6px}
   .refdrop.drag{border-color:var(--accent);color:#cdbcff}
   .refdrop img{max-width:100%;max-height:190px;border-radius:9px;display:block}
+  /* above the lightbox (z 80): the editor opens from inside it */
+  #editVeil{z-index:90}
+  .editwrap{width:min(940px,96vw);max-height:92vh;display:flex;flex-direction:column;
+        gap:12px;background:var(--panel);border:1px solid var(--line);
+        border-radius:18px;padding:20px 22px}
+  .editwrap h1{margin:0;font-size:17px}
+  .editwrap .frame{flex:1;min-height:0;display:grid;place-items:center;
+        background:#050507;border:1px solid var(--hair);border-radius:12px;
+        padding:10px;overflow:hidden}
+  .editwrap canvas{max-width:100%;max-height:62vh;border-radius:8px;
+        cursor:crosshair;touch-action:none}
+  .editrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .editrow .lab{font-size:12px;color:var(--muted)}
+  .editrow input[type=range]{width:140px;accent-color:var(--accent)}
   .pick input{margin-top:3px;accent-color:var(--accent);width:auto}
   .pick b{display:block;font-size:13.5px}
   .pick em{font-style:normal;font-size:12.5px;color:var(--muted);display:block;
@@ -645,6 +659,24 @@
 </div>
 
 <!-- lightbox -->
+<div class="veil" id="editVeil" hidden role="dialog" aria-modal="true"
+     aria-labelledby="editTitle">
+  <div class="editwrap">
+    <h1 id="editTitle">Edit the picture</h1>
+    <p class="note" style="margin:0">Paint over what should change — only the painted
+      area is regenerated, the rest stays exactly as it is. Then describe the whole
+      scene (or just the change) in the prompt and press Generate.</p>
+    <div class="frame"><canvas id="editCanvas"></canvas></div>
+    <div class="editrow">
+      <span class="lab">Brush</span>
+      <input type="range" id="edit-brush" min="12" max="160" step="4" value="56">
+      <button class="btn thin" id="btnEditClear">Clear</button>
+      <span class="grow"></span>
+      <button class="btn go" id="btnEditApply">Edit this</button>
+      <button class="btn" id="btnEditCancel">Cancel</button>
+    </div>
+  </div>
+</div>
 <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true"
      aria-labelledby="lbTitle">
   <div class="stage"><img id="lbImg" alt=""></div>
@@ -656,6 +688,7 @@
       <button class="btn go" id="lbReuse">Reuse settings</button>
       <button class="btn" id="lbVary">Vary</button>
       <button class="btn" id="lbAsRef">Use as reference</button>
+      <button class="btn" id="lbEdit">Edit</button>
       <button class="btn" id="lbDownload">Download</button>
       <button class="btn" id="lbDelete">Delete</button>
       <button class="btn" id="lbClose">Close</button>
@@ -792,14 +825,15 @@ function syncSize() {
 function refSync() {
   $("btnRef").classList.toggle("on", !!S.ref);
   $("refLabel").textContent = S.ref
-    ? "Reference \u00b7 " + $("ref-sl").value + "%" : "Reference";
+    ? (S.ref.mask ? "Edit · " : "Reference · ") + $("ref-sl").value + "%"
+    : "Reference";
   $("refVal").textContent = $("ref-sl").value + "%";
   $("refThumb").hidden = !S.ref;
   $("refDropHint").hidden = !!S.ref;
   $("refDrop").classList.toggle("has", !!S.ref);
 }
-function setRef(name) {
-  S.ref = { name: name };
+function setRef(name, mask) {
+  S.ref = { name: name, mask: mask || "" };
   // cache-bust: re-using the same file name must show the new picture
   $("refThumb").src = "/api/ref-preview?name=" + encodeURIComponent(name) +
     "&t=" + Date.now();
@@ -826,6 +860,105 @@ async function uploadRef(file) {
   } finally {
     $("refDropHint").textContent = "Click to choose an image, or drop one here";
   }
+}
+
+/* ========================= edit (inpainting) ========================= */
+var ED = { im: null, img: null, mask: null, painting: false, last: null };
+function openEditor(im) {
+  var img = new Image();
+  img.onload = function () {
+    ED.im = im; ED.img = img;
+    ED.mask = document.createElement("canvas");
+    ED.mask.width = img.naturalWidth; ED.mask.height = img.naturalHeight;
+    var cv = $("editCanvas");
+    cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+    $("editVeil").hidden = false;
+    drawEditor();
+    $("btnEditApply").focus();
+  };
+  img.onerror = function () { toast("Could not load the picture.", true); };
+  img.src = "/api/image/" + im.id;
+}
+function closeEditor() {
+  $("editVeil").hidden = true;
+  ED.im = ED.img = ED.mask = null;
+}
+function drawEditor() {
+  if (!ED.img) return;
+  var cv = $("editCanvas"), ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(ED.img, 0, 0);
+  // tint the painted area red so it reads as "this part gets repainted"
+  var tint = document.createElement("canvas");
+  tint.width = cv.width; tint.height = cv.height;
+  var tctx = tint.getContext("2d");
+  tctx.fillStyle = "#ff2d7a";
+  tctx.fillRect(0, 0, tint.width, tint.height);
+  tctx.globalCompositeOperation = "destination-in";
+  tctx.drawImage(ED.mask, 0, 0);
+  ctx.globalAlpha = 0.55;
+  ctx.drawImage(tint, 0, 0);
+  ctx.globalAlpha = 1;
+}
+function editStamp(x, y) {
+  var r = Number($("edit-brush").value) * (ED.mask.width / $("editCanvas")
+    .getBoundingClientRect().width) / 2;
+  var m = ED.mask.getContext("2d");
+  var grad = m.createRadialGradient(x, y, r * 0.55, x, y, r);
+  grad.addColorStop(0, "rgba(255,255,255,1)");
+  grad.addColorStop(1, "rgba(255,255,255,0)");   // a soft edge blends the seam
+  m.fillStyle = grad;
+  m.beginPath(); m.arc(x, y, r, 0, Math.PI * 2); m.fill();
+}
+function editPos(ev) {
+  var cv = $("editCanvas"), rect = cv.getBoundingClientRect();
+  return { x: (ev.clientX - rect.left) * (cv.width / rect.width),
+           y: (ev.clientY - rect.top) * (cv.height / rect.height) };
+}
+function fitSizeTo(width, height) {
+  var best = "1:1", bestDiff = 9;
+  Object.keys(RATIOS).forEach(function (k) {
+    var r = RATIOS[k], diff = Math.abs((r[0] / r[1]) - (width / height));
+    if (diff < bestDiff) { bestDiff = diff; best = k; }
+  });
+  S.ratio = best;
+  S.mp = Math.max(0.5, Math.min(2, Math.round((width * height / 1048576) * 10) / 10));
+  $("mp-sl").value = S.mp;
+  $("segRatio").querySelectorAll("button").forEach(function (b) {
+    b.classList.toggle("on", b.dataset.v === best); });
+}
+async function applyEdit() {
+  if (!ED.im || !ED.mask) return;
+  var m = ED.mask.getContext("2d").getImageData(0, 0, ED.mask.width, ED.mask.height).data;
+  var any = false;
+  for (var i = 3; i < m.length; i += 4) if (m[i]) { any = true; break; }
+  if (!any) { toast("Paint over the part to change first.", true); return; }
+  var b = busy($("btnEditApply"), "Sending…");
+  try {
+    // The mask travels as its own opaque black/white picture: a canvas export
+    // cannot keep colour underneath transparent pixels, so alpha is no use.
+    var flat = document.createElement("canvas");
+    flat.width = ED.mask.width; flat.height = ED.mask.height;
+    var fctx = flat.getContext("2d");
+    fctx.fillStyle = "#000";
+    fctx.fillRect(0, 0, flat.width, flat.height);
+    fctx.drawImage(ED.mask, 0, 0);
+    var blob = await new Promise(function (res) { flat.toBlob(res, "image/png"); });
+    var up = await api("/api/image/" + ED.im.id + "/as-reference", { method: "POST" });
+    var fd = new FormData();
+    fd.append("file", new File([blob], "edit_mask_" + Date.now() + ".png",
+                               { type: "image/png" }));
+    var mk = await api("/api/upload-image", { method: "POST", body: fd });
+    setRef(up.name, mk.name);
+    $("ref-sl").value = 90;                 // the painted area is meant to change
+    fitSizeTo(ED.im.width || ED.mask.width, ED.im.height || ED.mask.height);
+    refSync();
+    closeEditor();
+    closeLightbox();
+    show("create");
+    toast("Edit ready — describe the change and press Generate.");
+  } catch (e) { toast(e.message, true); }
+  finally { b.done(); }
 }
 
 /* ========================= regions ========================= */
@@ -1061,6 +1194,7 @@ function collect() {
     return { name: n, strength: S.loraPick[n].strength }; });
   if (S.ref) {
     p.ref_image = S.ref.name;
+    if (S.ref.mask) p.ref_mask = S.ref.mask;
     p.ref_denoise = Number($("ref-sl").value) / 100;
   }
   var seed = $("seed").value.trim();
@@ -1261,7 +1395,7 @@ function reuse(im) {
   });
   renderLoraPick();
   if (im.ref_image) {
-    setRef(im.ref_image);
+    setRef(im.ref_image, im.ref_mask);
     if (im.ref_denoise) $("ref-sl").value = Math.round(im.ref_denoise * 100);
     refSync();
   } else {
@@ -1305,7 +1439,7 @@ function openLightbox(im) {
   ["style", "style_photo", "lighting", "medium", "background", "aesthetics"]
     .forEach(function (f) { if (im[f]) rows.push([f.replace("_", " "), im[f]]); });
   if ((im.regions || []).length) rows.push(["Regions", im.regions.length]);
-  if (im.ref_image) rows.push(["Reference",
+  if (im.ref_image) rows.push([im.ref_mask ? "Edited" : "Reference",
     (im.ref_denoise ? Math.round(im.ref_denoise * 100) + "% repaint" : "used")]);
   if (im.builder === false) rows.push(["Prompt builder", "not used"]);
   $("lbMeta").innerHTML = rows.map(function (r) {
@@ -2144,6 +2278,37 @@ function wire() {
     if (S.lightbox) window.open("/api/image/" + S.lightbox.id, "_blank"); });
   $("lbDelete").addEventListener("click", function () {
     if (S.lightbox) removeImage(S.lightbox); });
+  $("lbEdit").addEventListener("click", function () {
+    if (S.lightbox) openEditor(S.lightbox);
+  });
+  $("btnEditCancel").addEventListener("click", closeEditor);
+  $("btnEditClear").addEventListener("click", function () {
+    if (!ED.mask) return;
+    ED.mask.getContext("2d").clearRect(0, 0, ED.mask.width, ED.mask.height);
+    drawEditor();
+  });
+  $("btnEditApply").addEventListener("click", applyEdit);
+  var ecv = $("editCanvas");
+  ecv.addEventListener("pointerdown", function (ev) {
+    if (!ED.mask) return;
+    ED.painting = true;
+    ecv.setPointerCapture(ev.pointerId);
+    var pt = editPos(ev);
+    editStamp(pt.x, pt.y); ED.last = pt; drawEditor();
+  });
+  ecv.addEventListener("pointermove", function (ev) {
+    if (!ED.painting || !ED.mask) return;
+    var pt = editPos(ev), last = ED.last || pt;
+    var d = Math.hypot(pt.x - last.x, pt.y - last.y), steps = Math.max(1, d / 6);
+    for (var i = 1; i <= steps; i++) {
+      editStamp(last.x + (pt.x - last.x) * i / steps,
+                last.y + (pt.y - last.y) * i / steps);
+    }
+    ED.last = pt; drawEditor();
+  });
+  ["pointerup", "pointercancel"].forEach(function (evn) {
+    ecv.addEventListener(evn, function () { ED.painting = false; ED.last = null; });
+  });
   $("lbAsRef").addEventListener("click", async function () {
     if (!S.lightbox) return;
     try {
@@ -2230,6 +2395,7 @@ function wire() {
   document.addEventListener("keydown", function (e) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); generate(); }
     if (e.key === "Escape") {
+      if (!$("editVeil").hidden) { closeEditor(); return; }
       if (!$("lightbox").hidden) { closeLightbox(); return; }
       closePops();
       $("veil-settings").hidden = true;
