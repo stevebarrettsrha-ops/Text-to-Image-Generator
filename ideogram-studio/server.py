@@ -16,7 +16,8 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import (Flask, Response, jsonify, request, send_file,
+                   send_from_directory)
 
 import bootstrap
 import manager
@@ -244,6 +245,9 @@ def run_job(job_id: str, params: dict) -> None:
                 "lighting": params.get("lighting", ""),
                 "medium": params.get("medium", ""),
                 "regions": params.get("regions") or [],
+                "ref_image": params.get("ref_image") or "",
+                "ref_mask": params.get("ref_mask") or "",
+                "ref_denoise": built.get("ref_denoise"),
                 "width": params.get("width"), "height": params.get("height"),
                 "steps": params.get("steps"), "cfg": params.get("cfg"),
                 "guider_cfg": params.get("guider_cfg"),
@@ -557,6 +561,46 @@ def api_job_cancel(job_id: str):
         if job_id in jobs:
             jobs[job_id]["cancelled"] = True
     return jsonify({"ok": True})
+
+
+@app.get("/api/ref-preview")
+def api_ref_preview():
+    """Thumbnail for a reference already sitting in ComfyUI's input folder —
+    the page cannot read that folder itself, so relay ComfyUI's own /view."""
+    name = request.args.get("name", "")
+    if not name:
+        return jsonify({"error": "No name."}), 400
+    sub, _, fname = name.rpartition("/")
+    try:
+        r = client.view({"filename": fname, "subfolder": sub, "type": "input"})
+        r.raise_for_status()
+        return Response(r.iter_content(1024 * 64),
+                        content_type=r.headers.get("Content-Type", "image/png"))
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"ComfyUI could not serve it: {exc}"}), 502
+
+
+@app.post("/api/image/<image_id>/as-reference")
+def api_image_as_reference(image_id: str):
+    """Push a gallery image into ComfyUI's input folder so it can seed a run."""
+    for item in read_gallery():
+        if item["id"] == image_id:
+            path = IMAGES_DIR / item["file"]
+            if not path.exists():
+                return jsonify({"error": "That file is missing."}), 404
+
+            class _Upload:                     # the shape upload_image reads
+                filename = path.name
+                stream = open(path, "rb")
+                mimetype = mimetypes.guess_type(path.name)[0] or "image/png"
+            try:
+                return jsonify({"ok": True,
+                                "name": client.upload_image(_Upload())})
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"error": str(exc)}), 502
+            finally:
+                _Upload.stream.close()
+    return jsonify({"error": "Image not found."}), 404
 
 
 @app.post("/api/upload-image")

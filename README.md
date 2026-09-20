@@ -82,6 +82,13 @@ Everything else hangs off the bar:
   belongs inside it; set one to **Text** for words Ideogram should render. The
   pill shows the region count. Coordinates are normalised, so a layout survives a
   change of aspect ratio.
+- **Reference** — drop in a picture and generation starts from it (img2img):
+  the result keeps its layout and colours, and the **Repaint** slider says how
+  much the model is allowed to redo — low stays close, high only borrows the
+  rough composition. It is a starting point, not a style or face reference; the
+  open Ideogram 4 release has no node path for that. Any gallery image offers
+  **Use as reference** in its full view, and the engine has to be running to
+  receive the file, because it lands in ComfyUI's own input folder.
 - **Settings** — steps, prompt strength (the dual-model guider's CFG, the main
   dial), late CFG, shift, sampler, scheduler, seed.
 - **Model pill** and **×N** for images per run.
@@ -89,7 +96,10 @@ Everything else hangs off the bar:
 Hover any image for reuse, download and delete. Click it for the full view, with
 the prompt and every setting listed down the side — **Reuse settings** loads it
 all back into the bar, **Vary** does the same but clears the seed and fires a new
-run straight away.
+run straight away, and **Edit** opens the picture with a brush: paint over what
+should change, press **Edit this**, describe the change, and only the painted
+area is regenerated — the rest stays exactly as it was. The Reference pill shows
+**Edit · 90%** while an edit is loaded.
 
 `Ctrl` + `Enter` generates from anywhere.
 
