@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+ideogram-studio/data/
+ideogram-studio/tests/.inline.js

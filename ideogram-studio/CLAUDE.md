@@ -145,7 +145,62 @@ and an indeterminate bar — never a percentage pinned at 12%.
 object keys, which served them alphabetically and put "Check Python" last.
 `app.json.sort_keys = False` covers the rest of the API.
 
+## The engine kit — owning the engine, not just asking it
+
+A ComfyUI that is already running is the normal case, not the exception: an
+orphan from a previous launch, a ComfyUI Desktop, one started by hand. The app
+has to be able to adopt it, diagnose it, or close it and put its own in its
+place, and it has to say which of those it is doing.
+
+- **`stale_models` is the silent killer, and for this app it keys off the
+  diffusion-model list.** ComfyUI scans its model folders once, at startup:
+  weights downloaded afterwards are on disk and invisible. `engine_is_stale()`
+  is true when `missing_models()` is empty and no entry of `client.unets()`
+  (`UNETLoader.unet_name`, i.e. `models/diffusion_models`) contains
+  `MODEL_MARKER` — `"ideogram4"`, which every precision of both halves of the
+  pair carries. That is the list `resolve_models()` refuses without, so it is
+  the list whose emptiness breaks generation; the text encoder and VAE lists
+  are not the test. `/api/generate` refuses early on it with "press Restart",
+  because the graph builder's own message tells you to download files you
+  already have.
+- **Never kill what does not look like ComfyUI.** `take_over_port()` reads
+  each holder's command line and refuses anything without `python`, `main.py`
+  or `comfy` in it, naming what it found. A refusal is a 409 whose `error` is
+  advice that names the real obstacle — access denied, a supervisor, an
+  unknown process — never "close it yourself".
+- **`settled_free()` sleeps 2 s before believing the port is free.** A
+  supervisor (ComfyUI Desktop, a launcher script) respawns in under a second,
+  so quiet is only free once it stays quiet. Pids that change between rounds
+  are what proves supervision, which is why the first round's pids are kept.
+- **`_refresh_schema_when_up()` after every start.** `ComfyClient.schema()`
+  caches for two minutes, so without it the fresh model scan hides behind the
+  stale cache and the page still says the weights are missing.
+- **`ensure_engine_at_boot()` is the only auto-start.** Offline → start.
+  Online and healthy → adopt, and say so. Online but useless (stale scan,
+  KJNodes installed but not loaded, a different install on the address) →
+  replace through the same guard. `managed: false` is an external setup: it is
+  diagnosed and left alone, never seized.
+- **App-side lines go through `comfy_proc.note()`**, so what the app does *to*
+  the engine sits in the same ring buffer as what the engine says, and the
+  Engine console shows one story. `_note()` writes to both that and the setup
+  log.
+
 ## Validation gate — run after any edit
+
+```bash
+python tests/run.py            # gate + units + api, ~75 s
+python tests/run.py gate       # just the compile/parse/id/wiring checks
+```
+
+The `gate` module runs what used to be done by hand: py_compile on every
+module, `node --check` on the inline script, the diff of element ids the JS
+uses against the ids in the markup, and a scan for interactive controls no
+listener ever touches. `units` pins the process primitives (`port_pids`,
+`pid_cmdline`, `kill_pid` and what it reports). `api` runs a real `server.py`
+against real engine processes — `tests/harness.py` builds a fake ComfyUI
+install whose `main.py` serves `tests/mock_comfy.py` and scans its models
+folder once at startup, so takeover, adoption and the stale scan are exercised
+rather than mocked. The hand-run equivalent of the gate's first two checks:
 
 ```bash
 python -m py_compile server.py comfy.py bootstrap.py manager.py
