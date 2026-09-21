@@ -142,12 +142,46 @@ resume where they stopped. All three sets are listed, but you only ever need one
 only the set you are using can be short of anything, and files belonging to the
 other two read *not needed* rather than *missing*.
 
+## The engine: starting, restarting, taking over
+
+The app starts ComfyUI for you when it launches, and you can watch it do it.
+
+**It starts itself.** A launch ends with a working engine and no button pressed.
+If nothing is on the address, the app starts its own. If something is already
+there and it is healthy, the app adopts it and says so. If it is there but
+useless — it scanned its model folders before your weights finished
+downloading, KJNodes is installed but was never loaded, or a different install
+has the address — the app closes it and starts its own in its place. An engine
+you run yourself (external mode) is never touched: the app says what is wrong
+with it and leaves it alone.
+
+**Engine console.** The Engine page shows ComfyUI's own output as it appears,
+with one line above it saying what state things are in — starting, running,
+online but not ours, or the two quiet failures worth naming: *the weights are
+on disk but this ComfyUI started before they landed*, and *a different ComfyUI
+is answering at this address*. What the app does to the engine is written into
+the same console, so stopping and starting reads as one story.
+
+**Restart ComfyUI** sits next to Start. A restart is the only thing that makes
+ComfyUI rescan its model folders and load newly installed nodes, so it is the
+answer to "I downloaded the weights and the dropdown is still empty". If the
+engine was not started by this app, Restart takes it over: ComfyUI-Manager's
+own reboot first, and failing that the process holding the port is checked,
+stopped, and replaced with a managed one. It will not stop anything that does
+not look like ComfyUI, and when it cannot finish the job it says why — access
+denied, something supervising it, or the name of whatever else is on the port —
+instead of sending you to hunt a windowless `python.exe` in Task Manager.
+
 ---
 
 ## Troubleshooting
 
+**"Restart the engine", or an empty model dropdown** — the weights are on disk
+but ComfyUI scanned its model folders before they landed. Press
+**Restart ComfyUI** on the Engine page; it rescans on the way back up.
+
 **"Nodes not loaded"** — ComfyUI is up but has not imported the nodes. Restart it.
-If it persists, check the ComfyUI console for `IMPORT FAILED`.
+If it persists, check the Engine console for `IMPORT FAILED`.
 
 **Regions seem to be ignored** — KJNodes is not loaded, so there is no
 `Ideogram4PromptBuilderKJ`. The app falls back to folding the fields and regions
@@ -171,8 +205,11 @@ manager.py     Dependency checks and installers, HuggingFace browsing
 comfy.py       Builds the Ideogram 4 graph from ComfyUI's live schema
 web/index.html The interface — one file, no build step
 assets/        ideogram4_reference.json, the workflow this was built from
+tests/         python tests/run.py — the gate, the process primitives, and the
+               engine kit end to end against real engine processes
 data/          config.json, gallery.json, images/
 ```
 
 Port: set `IDEOGRAM_STUDIO_PORT`. Set `IDEOGRAM_STUDIO_NO_BROWSER=1` to stop it
-opening a tab.
+opening a tab. `IDEOGRAM_STUDIO_DATA` moves the data folder, which is how the
+tests run against a throwaway one.

@@ -16,6 +16,8 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse
 
+import requests
+
 from flask import (Flask, Response, jsonify, request, send_file,
                    send_from_directory)
 
@@ -25,11 +27,26 @@ from bootstrap import (APP_DIR, ComfyProcess, Progress, comfy_online,
                        detect_comfy_dirs, load_config, save_config)
 from comfy import ComfyClient, ComfyError
 
-DATA_DIR = APP_DIR / "data"
+DATA_DIR = bootstrap.DATA_DIR          # honours IDEOGRAM_STUDIO_DATA
 IMAGES_DIR = DATA_DIR / "images"
 GALLERY_PATH = DATA_DIR / "gallery.json"
 WEB_DIR = APP_DIR / "web"
 PORT = int(os.environ.get("IDEOGRAM_STUDIO_PORT", "7802"))
+
+# Which of ComfyUI's lists decides whether this app can generate at all, and
+# what to look for in it. resolve_models() reads the diffusion-model list
+# (UNETLoader.unet_name) first and refuses without it, and every weight the
+# Models page downloads for the image model — every precision, both halves of
+# the pair — is named ideogram4_*.safetensors. An empty-of-ideogram4 list next
+# to a full models folder therefore means one thing: the engine scanned before
+# the weights landed. The text encoder and VAE lists are not the test; a run
+# fails on the diffusion models first.
+MODEL_MARKER = "ideogram4"
+# The node the graph cannot be built without, and the pack markers worth
+# checking: ComfyUI-Manager registers no node class, KJNodes carries the
+# prompt builder.
+CORE_NODE = "DualModelGuider"
+NODE_MARKERS = {"kjnodes": "Ideogram4PromptBuilderKJ"}
 
 app = Flask(__name__, static_folder=None)
 # Flask sorts JSON object keys by default, which would reorder anything
@@ -290,6 +307,27 @@ def web_asset(name: str):
 # --------------------------------------------------------------------------- #
 # status / setup
 # --------------------------------------------------------------------------- #
+def engine_is_stale() -> bool:
+    """True when every weight is on disk and the engine's own diffusion-model
+    list still does not have them.
+
+    ComfyUI scans its model folders once, at startup. A download that lands
+    afterwards is on disk and invisible, so the dropdowns are empty and every
+    run dies on "no model" — advice to download what is already there. Only a
+    restart makes it look again.
+    """
+    models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
+    if not models_dir or not models_dir.is_dir():
+        return False
+    if bootstrap.missing_models(models_dir, cfg):
+        return False        # genuinely missing is a different problem
+    try:
+        unets = client.unets()
+    except Exception:       # noqa: BLE001  nothing to judge if it will not say
+        return False
+    return not any(MODEL_MARKER in u.lower() for u in unets)
+
+
 @app.get("/api/status")
 def api_status():
     online = comfy_online(cfg["comfy_url"])
@@ -316,7 +354,7 @@ def api_status():
     if online:
         try:
             payload["capabilities"] = client.capabilities()
-            payload["nodes_ready"] = client.has("DualModelGuider")
+            payload["nodes_ready"] = client.has(CORE_NODE)
             payload["samplers"] = client.samplers()
             payload["schedulers"] = client.schedulers()
             payload["unets"] = client.unets()
@@ -324,6 +362,18 @@ def api_status():
             payload["vaes"] = client.vaes()
         except Exception as exc:  # noqa: BLE001
             payload["schema_error"] = str(exc)
+        # The two silent "nothing works" states, named: an engine that scanned
+        # before the weights landed, and an address answered by a different
+        # install than the one this app set up.
+        payload["stale_models"] = engine_is_stale()
+        stats = bootstrap.comfy_stats(cfg["comfy_url"]) or {}
+        argv = (stats.get("argv") or [""])[0]
+        payload["engine_argv"] = argv
+        want = (str(Path(cfg["comfy_dir"])).replace("\\", "/").lower()
+                if cfg.get("comfy_dir") else "")
+        payload["engine_mismatch"] = bool(
+            argv and want and want not in argv.replace("\\", "/").lower())
+        payload["engine_managed"] = comfy_proc.alive()
     payload["ready"] = bool(online and payload["nodes_ready"] and not missing)
     return jsonify(payload)
 
@@ -352,6 +402,115 @@ def api_setup_state():
     return jsonify(snap)
 
 
+def _note(msg: str) -> None:
+    """Engine actions belong in the engine console, next to its own output."""
+    comfy_proc.note(msg)
+    progress.log(msg)
+
+
+def take_over_port(url: str, port: int):
+    """Close whatever ComfyUI answers on the port.
+
+    Returns ("manager-reboot", None) when ComfyUI-Manager rebooted it in
+    place, ("freed", None) when the port is now empty, or (None, advice)
+    when it cannot be done — with advice that names the actual obstacle,
+    because "close it yourself" against a windowless process is a treasure
+    hunt through Task Manager.
+    """
+    _note("This ComfyUI was not started here — taking it over.")
+    try:
+        r = requests.post(f"{url}/manager/reboot", json={}, timeout=5)
+        accepted = r.status_code in (200, 201, 204)
+    except requests.exceptions.RequestException:
+        accepted = True          # the connection dropping is the reboot
+    if accepted:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not comfy_online(url):
+                _note("ComfyUI-Manager took the reboot; waiting for the "
+                      "engine to come back.")
+                return "manager-reboot", None
+            time.sleep(0.5)
+        _note("ComfyUI-Manager did not take the reboot; stopping the "
+              "process instead.")
+
+    def settled_free() -> bool:
+        # a supervisor (ComfyUI Desktop, a launcher .bat) respawns in under
+        # a second — quiet is only free once it stays quiet
+        time.sleep(2.0)
+        return not comfy_online(url) and not bootstrap.port_pids(port)
+
+    first_pids: list[int] = []
+    denied = False
+    for attempt in range(3):
+        pids = bootstrap.port_pids(port)
+        if attempt == 0:
+            first_pids = pids
+        if not pids:
+            if not comfy_online(url) and settled_free():
+                return "freed", None
+            if not comfy_online(url):
+                _note("It came straight back — something restarted it.")
+                continue
+            return None, (f"Something answers on port {port} but its process "
+                          "could not be found — it may belong to another "
+                          "user account. Close it in Task Manager, then "
+                          "press Start ComfyUI.")
+        for pid in pids:
+            cmd = bootstrap.pid_cmdline(pid)
+            _note(f"Port {port} is held by pid {pid}"
+                  + (f": {cmd[:120]}" if cmd else " (command line unreadable)"))
+            if cmd and not any(k in cmd.lower()
+                               for k in ("python", "main.py", "comfy")):
+                return None, (f"Port {port} is held by something that does "
+                              f"not look like ComfyUI ({cmd[:90]}). Close it "
+                              "yourself, or point Settings at a different "
+                              "address.")
+        for pid in pids:
+            said = bootstrap.kill_pid(pid)
+            _note(f"Stopping pid {pid} — {said or 'no reply'}")
+            if "denied" in (said or "").lower() \
+                    or "access" in (said or "").lower():
+                denied = True
+        deadline = time.time() + 8
+        while comfy_online(url) and time.time() < deadline:
+            time.sleep(0.5)
+        if not comfy_online(url):
+            if settled_free():
+                return "freed", None
+            _note("It came straight back — something restarted it.")
+            continue
+        _note("Still answering — trying again.")
+
+    now = bootstrap.port_pids(port)
+    if denied:
+        return None, ("The system refused to stop it (access denied) — it was "
+                      "started as another user, or as administrator. Run "
+                      "Ideogram Studio as administrator once, or close it in "
+                      "Task Manager, then press Start ComfyUI.")
+    if now and set(now) != set(first_pids):
+        return None, ("It keeps coming back under a new process id — "
+                      "something is supervising it (ComfyUI Desktop, or a "
+                      "launcher script). Close that application, then press "
+                      "Start ComfyUI.")
+    return None, ("It would not close. The Engine console shows what was "
+                  "tried; close it in Task Manager, then press Start "
+                  "ComfyUI.")
+
+
+def _refresh_schema_when_up() -> None:
+    """After a (re)start, drop the cached schema the moment the engine
+    answers — otherwise the fresh model scan hides behind the old cache
+    for up to two minutes, and the page still says the weights are missing."""
+    def wait():
+        if bootstrap.wait_for_comfy(cfg["comfy_url"], timeout=900):
+            try:
+                client.schema(force=True)
+            except Exception:
+                pass
+    threading.Thread(target=wait, daemon=True).start()
+
+
 @app.post("/api/comfy/start")
 def api_comfy_start():
     if comfy_online(cfg["comfy_url"]):
@@ -366,9 +525,73 @@ def api_comfy_start():
                             "it. Start ComfyUI yourself, then press "
                             "Recheck."}), 400
         return jsonify({"error": "Run setup first."}), 400
+    _note("Starting ComfyUI…")
     comfy_proc.start(py, Path(cfg["comfy_dir"]),
                      int(cfg["comfy_url"].rsplit(":", 1)[-1]), progress)
+    _refresh_schema_when_up()
     return jsonify({"ok": True})
+
+
+@app.post("/api/comfy/restart")
+def api_comfy_restart():
+    """Stop and start ComfyUI, so it rescans its model folders and loads
+    newly installed nodes — the two things only a restart does.
+
+    An engine this app did not start (an orphan from an earlier run, or one
+    launched by hand) is taken over rather than declared unreachable: first
+    ComfyUI-Manager's own reboot, and failing that the process holding the
+    configured port is verified to look like ComfyUI and stopped, then a
+    managed one starts in its place. The old advice — "close it yourself" —
+    asked people to hunt a windowless python in Task Manager.
+    """
+    url = cfg["comfy_url"]
+    port = int(url.rsplit(":", 1)[-1])
+    py = bootstrap.comfy_python(cfg)
+    can_start = bool(cfg.get("comfy_dir") and py)
+
+    if comfy_proc.alive():
+        if not can_start:
+            return jsonify({"error": "Run setup first."}), 400
+        _note("Restarting the managed engine…")
+        comfy_proc.stop()
+        comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
+        _refresh_schema_when_up()
+        return jsonify({"ok": True, "how": "managed"})
+
+    if not comfy_online(url):
+        if not can_start:
+            return jsonify({"error": "Run setup first."}), 400
+        _note("Starting ComfyUI…")
+        comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
+        _refresh_schema_when_up()
+        return jsonify({"ok": True, "how": "started"})
+
+    # online, but not ours — take it over
+    how, advice = take_over_port(url, port)
+    if advice:
+        return jsonify({"error": advice}), 409
+    if how == "manager-reboot":
+        _refresh_schema_when_up()
+        return jsonify({"ok": True, "how": "manager-reboot"})
+    if not can_start:
+        return jsonify({"ok": True, "how": "stopped",
+                        "note": "Stopped it. This app has no ComfyUI of its "
+                                "own to start — run setup, or start yours "
+                                "again yourself."})
+    _note("Starting a managed engine in its place…")
+    comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
+    _refresh_schema_when_up()
+    return jsonify({"ok": True, "how": "takeover"})
+
+
+@app.get("/api/comfy/log")
+def api_comfy_log():
+    """The engine's own console — the visible cue that it is starting,
+    started, or telling you exactly what failed to import."""
+    n = min(max(int(request.args.get("n", 80)), 1), 400)
+    return jsonify({"lines": comfy_proc.tail(n),
+                    "running": comfy_proc.alive(),
+                    "online": comfy_online(cfg["comfy_url"])})
 
 
 @app.post("/api/config")
@@ -526,6 +749,13 @@ def api_generate():
     if not comfy_online(cfg["comfy_url"]):
         return jsonify({"error": "ComfyUI is not running. Start it from the "
                                  "Engine page."}), 503
+    # Without this the run fails deep in the graph builder with "no files in
+    # diffusion_models" — advice to download weights that are already on disk.
+    if engine_is_stale():
+        return jsonify({"error": "The weights are on disk, but this ComfyUI "
+                                 "started before they landed and has not "
+                                 "rescanned — so it cannot see them. Press "
+                                 "Restart ComfyUI on the Engine page."}), 409
     runs = max(1, min(int(params.get("runs") or 1), 4))
     created = []
     for _ in range(runs):
@@ -681,17 +911,87 @@ def api_lora_delete():
         return jsonify({"error": str(exc)}), 400
 
 
+def ensure_engine_at_boot() -> None:
+    """A launch ends with a working engine, without a button pressed.
+
+    Offline: start the managed one, as the old inline auto-start did. Online
+    and healthy: adopt it and say so. Online but useless — a stale scan hiding
+    the weights, installed nodes it never loaded, or a different install
+    squatting the port — replace it, with the same looks-like-ComfyUI guard
+    the Restart button uses. An external-mode setup (managed False) is never
+    touched: that engine is the person's own.
+    """
+    if not (cfg.get("setup_complete") and cfg.get("auto_start_comfy", True)):
+        return
+    py = bootstrap.comfy_python(cfg)
+    if not cfg.get("comfy_dir") or not py:
+        return
+    url = cfg["comfy_url"]
+    port = int(url.rsplit(":", 1)[-1])
+
+    if not comfy_online(url):
+        _note("Restarting ComfyUI from the last setup…")
+        comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
+        _refresh_schema_when_up()
+        return
+
+    # something already answers — decide between adopting and replacing
+    reasons = []
+    try:
+        client.schema(force=True)
+        has_nodes = client.has(CORE_NODE)
+        unets = client.unets()
+    except Exception as exc:  # noqa: BLE001
+        _note(f"The engine already running would not describe itself "
+              f"({exc}) — leaving it alone.")
+        return
+    models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
+    weights_here = bool(models_dir and models_dir.is_dir() and
+                        not bootstrap.missing_models(models_dir, cfg))
+    if weights_here and not any(MODEL_MARKER in u.lower() for u in unets):
+        reasons.append("it started before the weights landed")
+    if not has_nodes and weights_here:
+        reasons.append("the Ideogram 4 nodes are not loaded")
+    for node in bootstrap.CUSTOM_NODES:
+        marker = NODE_MARKERS.get(node["id"])
+        if marker and bootstrap.node_installed(Path(cfg["comfy_dir"]), node) \
+                and not client.has(marker):
+            reasons.append(f"{node['label']} is installed but not loaded")
+    stats = bootstrap.comfy_stats(url) or {}
+    argv = (stats.get("argv") or [""])[0]
+    want = str(Path(cfg["comfy_dir"])).replace("\\", "/").lower()
+    if argv and want and want not in argv.replace("\\", "/").lower():
+        reasons.append("a different install is answering the address")
+
+    if not reasons:
+        _note(f"Adopting the ComfyUI already running at {url}.")
+        return
+    if not cfg.get("managed", True):
+        _note("The engine already running has problems ("
+              + "; ".join(reasons) + ") but it is yours, not this app's — "
+              "restart it yourself, or press Restart ComfyUI.")
+        return
+    _note("The engine already running is no use as it stands — "
+          + "; ".join(reasons) + ". Replacing it.")
+    how, advice = take_over_port(url, port)
+    if advice:
+        _note(advice)
+        return
+    if how == "manager-reboot":
+        _refresh_schema_when_up()
+        return
+    _note("Starting a managed engine in its place…")
+    comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
+    _refresh_schema_when_up()
+
+
 # --------------------------------------------------------------------------- #
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=ws_listener, daemon=True).start()
-    if cfg.get("setup_complete") and cfg.get("auto_start_comfy", True) \
-            and cfg.get("comfy_dir") and bootstrap.comfy_python(cfg) \
-            and not comfy_online(cfg["comfy_url"]):
-        progress.log("Restarting ComfyUI from the last setup…")
-        comfy_proc.start(bootstrap.comfy_python(cfg), Path(cfg["comfy_dir"]),
-                         int(cfg["comfy_url"].rsplit(":", 1)[-1]), progress)
+    # the engine comes up on its own; the page can open meanwhile
+    threading.Thread(target=ensure_engine_at_boot, daemon=True).start()
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Ideogram Studio  →  {url}\n")
     if os.environ.get("IDEOGRAM_STUDIO_NO_BROWSER") != "1":

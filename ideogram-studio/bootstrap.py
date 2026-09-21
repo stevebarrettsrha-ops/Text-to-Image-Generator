@@ -19,6 +19,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -29,7 +30,10 @@ from urllib.parse import unquote
 import requests
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
+# Config, gallery and finished images. IDEOGRAM_STUDIO_DATA moves the lot,
+# which is what lets the tests run against a throwaway folder instead of the
+# library of a real install.
+DATA_DIR = Path(os.environ.get("IDEOGRAM_STUDIO_DATA") or (APP_DIR / "data"))
 CONFIG_PATH = DATA_DIR / "config.json"
 
 COMFY_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
@@ -519,6 +523,14 @@ class ComfyProcess:
         self.lines: list[str] = []
         self._lock = threading.Lock()
 
+    def note(self, msg: str) -> None:
+        """An app-side line in the engine console — what the app is doing TO
+        the engine belongs next to what the engine itself says."""
+        with self._lock:
+            self.lines.append(f"[Ideogram Studio] {msg}")
+            if len(self.lines) > 2000:
+                del self.lines[:1000]
+
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
@@ -570,6 +582,133 @@ def comfy_online(url: str) -> bool:
         return requests.get(f"{url}/system_stats", timeout=3).status_code == 200
     except Exception:
         return False
+
+
+def _pids_from_proc_net(port: int) -> list[int]:
+    """Linux, no tools needed: the socket inode from /proc/net/tcp*, then the
+    process whose fd table holds it."""
+    inodes = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local, state, inode = parts[1], parts[3], parts[9]
+            if state == "0A" and local.rsplit(":", 1)[-1] == f"{port:04X}":
+                inodes.add(inode)
+    pids = set()
+    if not inodes:
+        return []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            for fd in (proc / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if any(f"socket:[{i}]" == target for i in inodes):
+                    pids.add(int(proc.name))
+                    break
+        except OSError:
+            continue
+    return sorted(pids)
+
+
+def port_pids(port: int) -> list[int]:
+    """Whoever is listening on the port."""
+    if platform.system() == "Windows":
+        pids = set()
+        try:
+            out = _run(["netstat", "-ano", "-p", "TCP"], timeout=25).stdout
+        except Exception:
+            return []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] == "TCP" \
+                    and parts[3] == "LISTENING" \
+                    and parts[1].rsplit(":", 1)[-1] == str(port):
+                try:
+                    pids.add(int(parts[4]))
+                except ValueError:
+                    pass
+        return sorted(pids)
+    found = _pids_from_proc_net(port)
+    if found:
+        return found
+    if shutil.which("lsof"):
+        try:
+            out = _run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                       timeout=25).stdout
+            return sorted({int(t) for t in out.split() if t.strip().isdigit()})
+        except Exception:
+            pass
+    return []
+
+
+def pid_cmdline(pid: int) -> str:
+    try:
+        if platform.system() == "Windows":
+            out = _run(["wmic", "process", "where", f"processid={pid}",
+                        "get", "commandline"], timeout=25).stdout
+            lines = [ln.strip() for ln in out.splitlines()
+                     if ln.strip() and "CommandLine" not in ln]
+            return lines[0] if lines else ""
+        cmd = Path(f"/proc/{pid}/cmdline")
+        if cmd.exists():
+            return cmd.read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace").strip()
+        return _run(["ps", "-p", str(pid), "-o", "command="],
+                    timeout=25).stdout.strip()
+    except Exception:
+        return ""
+
+
+def kill_pid(pid: int) -> str:
+    """Stop a process: politely first, firmly if it lingers. Returns what the
+    system said about it, so a refusal (access denied, already gone) can be
+    shown instead of guessed at."""
+    if platform.system() == "Windows":
+        try:
+            out = _run(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=30)
+            return (out.stdout or out.stderr or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            return str(exc)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already gone"
+    except PermissionError:
+        return "access denied"
+    for _ in range(25):
+        time.sleep(0.2)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "stopped"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "stopped"
+    except PermissionError:
+        return "access denied"
+    return "sent SIGKILL"
+
+
+def comfy_stats(url: str) -> dict | None:
+    """What is actually answering on the address — argv says which install."""
+    try:
+        r = requests.get(f"{url}/system_stats", timeout=3)
+        if r.status_code == 200:
+            return r.json().get("system") or {}
+    except Exception:
+        pass
+    return None
 
 
 def wait_for_comfy(url: str, timeout: int = 900, on_wait=None) -> bool:

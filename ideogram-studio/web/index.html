@@ -541,8 +541,15 @@
           <button class="btn" id="btnRecheck">Recheck</button>
           <button class="btn go" id="btnInstallAll">Install everything missing</button>
           <button class="btn" id="btnStartEngine">Start ComfyUI</button>
+          <button class="btn" id="btnRestartEngine">Restart ComfyUI</button>
           <button class="btn" id="btnReRun">Run setup again</button>
         </div>
+      </div>
+      <div class="panel">
+        <h2>Engine console</h2>
+        <p class="sub" id="engine-state">Checking…</p>
+        <div class="log" id="engine-log">Nothing yet — start ComfyUI and its
+          output lands here.</div>
       </div>
       <div class="panel">
         <h2>PyTorch build</h2>
@@ -1140,7 +1147,7 @@ function show(view) {
   closePops();
   $("mainCol").scrollTop = 0;
   if (view === "models") { loadHf(); loadLocal(); loadLoras(); pollTasks(); }
-  if (view === "engine") { loadDeps(); pollTasks(); }
+  if (view === "engine") { loadDeps(); pollTasks(); pollEngineLog(); }
   if (view === "library") renderLib();
   if (view === "home") renderHome();
   if (view === "create") requestAnimationFrame(function () {
@@ -1663,9 +1670,11 @@ async function watchEngine() {
   var b = busy($("btnStartEngine"), "Starting…");
   var bar = $("task-bar");
   // There is no honest percentage for a model load, so show the real thing:
-  // elapsed time on the button, a moving bar, and ComfyUI's own console.
+  // elapsed time on the button, a moving bar, and — in the Engine console
+  // panel, which polls the engine's own output — what it is actually saying.
   $("task-title").textContent = "Starting the engine — the first start loads "
-    + "PyTorch and the models, which can take a few minutes. Its console:";
+    + "PyTorch and the models, which can take a few minutes. Its own output "
+    + "is in the Engine console above.";
   bar.hidden = false;
   bar.classList.add("indet");
   var began = Date.now();
@@ -1673,14 +1682,6 @@ async function watchEngine() {
     while (Date.now() - began < 5 * 60 * 1000) {
       await new Promise(function (t) { setTimeout(t, 1500); });
       b.label("Starting… " + Math.round((Date.now() - began) / 1000) + "s");
-      try {
-        var snap = await api("/api/setup/state?since=999999");
-        if (snap.comfy_tail && snap.comfy_tail.length) {
-          var log = $("task-log");
-          log.textContent = snap.comfy_tail.join("\n");
-          log.scrollTop = log.scrollHeight;
-        }
-      } catch (e) { /* the console feed is a nicety */ }
       var st = null;
       try { st = await api("/api/status"); } catch (e) { continue; }
       if (st.comfy_online) {
@@ -1692,8 +1693,8 @@ async function watchEngine() {
       }
       if (st.comfy_running_managed === false) {
         $("task-title").textContent = "The engine stopped while starting — "
-          + "its last words are below.";
-        toast("ComfyUI stopped while starting — see the Activity log on "
+          + "its last words are in the Engine console above.";
+        toast("ComfyUI stopped while starting — see the Engine console on "
           + "the Engine page.", true);
         refreshStatus();
         loadDeps();
@@ -1701,9 +1702,9 @@ async function watchEngine() {
       }
     }
     $("task-title").textContent = "Still not answering after five minutes — "
-      + "its console is below.";
+      + "its console is above.";
     toast("The engine did not come up within five minutes — see the "
-      + "Activity log.", true);
+      + "Engine console.", true);
   } finally {
     engineWatch = false;
     b.done();
@@ -1713,20 +1714,88 @@ async function watchEngine() {
 }
 async function startEngine() {
   if (engineWatch) {
-    toast("It is already starting — its console is in the Activity log on "
+    toast("It is already starting — its output is in the Engine console on "
       + "the Engine page.");
     return;
   }
   try {
     var r = await api("/api/comfy/start", { method: "POST" });
     if (r && r.already) {
-      toast("The engine is already running on that address.");
+      toast("The engine is already running on that address. If it cannot see "
+        + "new weights or nodes, press Restart ComfyUI instead.");
       refreshStatus();
       return;
     }
     if (r && r.starting) toast("It was already starting — watching it.");
     watchEngine();
   } catch (e) { toast(e.message, true); }
+}
+/* Restart is the only thing that makes ComfyUI rescan its model folders and
+   load newly installed nodes — and, when the engine answering is not ours,
+   the only way to be rid of it without hunting a windowless python. */
+async function restartEngine() {
+  var b = busy($("btnRestartEngine"), "Restarting…");
+  try {
+    var r = await api("/api/comfy/restart", { method: "POST" });
+    if (r.how === "manager-reboot") {
+      toast("ComfyUI-Manager is rebooting the engine — it rescans models "
+        + "and loads new nodes on the way back up.");
+    } else if (r.how === "takeover") {
+      toast("That ComfyUI was not started here, so it was closed and a "
+        + "managed one is starting — models rescan now. Watch the console "
+        + "below.");
+    } else if (r.how === "started") {
+      toast("Nothing was running, so it is starting now. Watch the console "
+        + "below.");
+    } else if (r.how === "stopped") {
+      toast(r.note || "Stopped it.", true);
+    } else {
+      toast("Restarting ComfyUI — it rescans its model folders and loads "
+        + "new nodes now. Watch the console below.");
+    }
+    show("engine");
+    if (r.how !== "stopped") watchEngine();
+  } catch (e) { toast(e.message, true); }
+  finally { b.done(); }
+}
+
+/* The engine's own console, polled while the Engine page is open. This is
+   the visible cue that it is starting, up, or saying what broke. */
+var engineLogTimer = null;
+async function pollEngineLog() {
+  clearTimeout(engineLogTimer);
+  if (S.view !== "engine") return;
+  var d;
+  try { d = await api("/api/comfy/log?n=120"); }
+  catch (e) { engineLogTimer = setTimeout(pollEngineLog, 4000); return; }
+  var log = $("engine-log");
+  var text = (d.lines || []).join("\n");
+  if (text && log.textContent !== text) {
+    var bottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.textContent = text;
+    if (bottom) log.scrollTop = log.scrollHeight;
+  }
+  var st = S.status || {};
+  var state;
+  if (st.stale_models && d.online) {
+    state = "⚠ The weights are on disk, but this ComfyUI started before "
+      + "they landed and has not rescanned. Press Restart ComfyUI.";
+  } else if (st.engine_mismatch && d.online) {
+    state = "⚠ A different ComfyUI is answering at "
+      + ((st.config || {}).comfy_url || "this address")
+      + (st.engine_argv ? " (" + st.engine_argv + ")" : "")
+      + ". Close it, or point Settings at the folder it runs from.";
+  } else if (d.running) {
+    state = d.online ? "Running — started by Ideogram Studio."
+      : "Starting… the first start is slow.";
+  } else if (d.online) {
+    state = "Online, but started outside Ideogram Studio — Restart ComfyUI "
+      + "will take it over.";
+  } else {
+    state = "Offline. Press Start ComfyUI.";
+  }
+  $("engine-state").textContent = state;
+  engineLogTimer = setTimeout(pollEngineLog, 2500);
 }
 var taskTimer = null;
 async function pollTasks() {
@@ -2065,10 +2134,15 @@ async function refreshStatus() {
   S.status = st;
   var pill = $("enginePill");
   var starting = !st.comfy_online && !!st.comfy_running_managed;
-  pill.classList.toggle("on", !!st.ready);
+  // The weights are there and the engine simply has not seen them. That is
+  // "ready" by every other measure and fails every generate, so say the one
+  // thing that fixes it rather than letting the pill read green.
+  var stale = !!(st.stale_models && st.comfy_online);
+  pill.classList.toggle("on", !!st.ready && !stale);
   pill.classList.toggle("off", !st.comfy_online && !starting);
   pill.classList.toggle("starting", starting);
-  pill.querySelector("span").textContent = st.ready ? "Engine ready"
+  pill.querySelector("span").textContent = stale ? "Restart the engine"
+    : st.ready ? "Engine ready"
     : starting ? "Engine starting…"
     : !st.comfy_online ? "Engine offline"
     : !st.nodes_ready ? "Nodes not loaded"
@@ -2335,6 +2409,7 @@ function wire() {
   });
   $("btnInstallAll").addEventListener("click", installAllMissing);
   $("btnStartEngine").addEventListener("click", startEngine);
+  $("btnRestartEngine").addEventListener("click", restartEngine);
   $("btnReRun").addEventListener("click", openSetup);
   $("btnCancelTask").addEventListener("click", function () {
     if (S.taskId) api("/api/tasks/" + S.taskId + "/cancel", { method: "POST" }); });
