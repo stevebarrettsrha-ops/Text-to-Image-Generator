@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -46,12 +47,8 @@ def orphan(code: str, ready: Path | None = None) -> int:
 def alive(pid: int, within: float = 0.0) -> bool:
     deadline = time.time() + within
     while True:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not bootstrap.pid_alive(pid):
             return False
-        except PermissionError:
-            return True
         if time.time() >= deadline:
             return True
         time.sleep(0.1)
@@ -80,6 +77,14 @@ def run(slow: bool = False) -> Suite:
             "python" in mine.lower() or "run.py" in mine, mine[:80])
     s.equal("and says nothing about a pid that does not exist",
             bootstrap.pid_cmdline(4_000_000), "")
+
+    # /proc is Linux-specific.  A Unix platform without it must use the
+    # portable signal probe rather than declaring every process dead.
+    with patch.object(bootstrap.platform, "system", return_value="Darwin"):
+        s.check("pid_alive falls back correctly when procfs is unavailable",
+                bootstrap.pid_alive(os.getpid()))
+    s.check("pid_alive rejects process-group sentinel ids",
+            not bootstrap.pid_alive(0) and not bootstrap.pid_alive(-1))
 
     # -- stopping things ----------------------------------------------------
     # Orphans on a port belong to nobody, so the tests use grandchildren too:

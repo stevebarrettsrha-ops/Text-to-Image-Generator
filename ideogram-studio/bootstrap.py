@@ -669,6 +669,44 @@ def pid_cmdline(pid: int) -> str:
         return ""
 
 
+def pid_alive(pid: int) -> bool:
+    """Return whether *pid* can still execute code.
+
+    ``kill(pid, 0)`` also succeeds for a zombie.  That distinction matters in
+    containers whose PID 1 does not promptly reap orphaned children: waiting
+    for such a process to disappear makes a successful stop look like a
+    timeout, followed by a pointless SIGKILL.  Linux exposes the state in
+    ``/proc``; other Unix systems retain the traditional signal probe.
+    """
+    # Process ids from the port-discovery paths are positive.  Guard this
+    # public helper as well: on POSIX, 0 and negative values target process
+    # groups rather than one process.
+    if pid <= 0:
+        return False
+    if platform.system() == "Linux":
+        try:
+            # The command name is parenthesised and may contain spaces, so the
+            # state is the first field after the final closing parenthesis.
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)
+            if len(fields) == 2 and fields[1].split()[0] == "Z":
+                return False
+        except FileNotFoundError:
+            # Linux normally has procfs mounted, in which case a missing pid
+            # entry proves the process is gone.  Minimal/chroot environments
+            # may omit procfs entirely, so retain the signal-probe fallback.
+            if Path("/proc").is_dir():
+                return False
+        except (OSError, IndexError):
+            pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def kill_pid(pid: int) -> str:
     """Stop a process: politely first, firmly if it lingers. Returns what the
     system said about it, so a refusal (access denied, already gone) can be
@@ -679,6 +717,8 @@ def kill_pid(pid: int) -> str:
             return (out.stdout or out.stderr or "").strip()
         except Exception as exc:  # noqa: BLE001
             return str(exc)
+    if not pid_alive(pid):
+        return "already gone"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -687,9 +727,7 @@ def kill_pid(pid: int) -> str:
         return "access denied"
     for _ in range(25):
         time.sleep(0.2)
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not pid_alive(pid):
             return "stopped"
     try:
         os.kill(pid, signal.SIGKILL)
@@ -697,6 +735,9 @@ def kill_pid(pid: int) -> str:
         return "stopped"
     except PermissionError:
         return "access denied"
+    # A killed orphan can remain as a zombie until its parent reaps it.  It is
+    # already stopped, but retain "sent SIGKILL" so the console accurately
+    # records that the forceful path was required.
     return "sent SIGKILL"
 
 
