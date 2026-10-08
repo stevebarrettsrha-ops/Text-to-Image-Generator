@@ -248,6 +248,7 @@ def studio(comfy_url: str, data: Path, models_dir: Path | None = None,
     return Server([sys.executable, "server.py"], port, "/api/status",
                   env={"IDEOGRAM_STUDIO_PORT": str(port),
                        "IDEOGRAM_STUDIO_NO_BROWSER": "1",
+                       "IDEOGRAM_STUDIO_NO_SEARCH": "1",
                        "IDEOGRAM_STUDIO_DATA": str(data)})
 
 
