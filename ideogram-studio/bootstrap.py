@@ -393,7 +393,12 @@ def have_git() -> bool:
 
 def detect_comfy_dirs() -> list[str]:
     home = Path.home()
-    cands = [APP_DIR / "ComfyUI", home / "ComfyUI",
+    # beside the app first: setup puts ComfyUI in here, and a portable build
+    # unpacked next to the repo is the other common layout
+    near = [APP_DIR, APP_DIR.parent, APP_DIR.parent.parent]
+    cands = [b / "ComfyUI" for b in near] + \
+            [b / "ComfyUI_windows_portable" / "ComfyUI" for b in near] + \
+            [home / "ComfyUI",
              home / "Documents" / "ComfyUI", home / "Desktop" / "ComfyUI",
              Path("C:/ComfyUI"), Path("C:/ComfyUI_windows_portable/ComfyUI"),
              Path("D:/ComfyUI"), Path("D:/ComfyUI_windows_portable/ComfyUI")]
@@ -413,6 +418,191 @@ def detect_comfy_dirs() -> list[str]:
                 out.append(str(c))
         except OSError:
             continue
+    return out
+
+
+def rebase_path(old: str) -> Path | None:
+    """Where a path saved under an earlier location of this app lives now.
+
+    The config keeps absolute paths. Move, rename or re-extract the folder
+    (text-to-image-generator -> text-to-image-generator-main, C: -> D:) and
+    every one of them points nowhere, though ComfyUI and the weights moved
+    with it. The tail after this app's own folder name is the same; graft it on here.
+    """
+    parts = [p for p in re.split(r"[\\/]+", old or "") if p]
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i].lower() == APP_DIR.name.lower():
+            cand = APP_DIR.joinpath(*parts[i + 1:])
+            try:
+                if cand.exists():
+                    return cand
+            except OSError:
+                return None
+    return None
+
+
+def heal_paths(cfg: dict) -> list[str]:
+    """Repair saved paths that no longer exist. Returns what changed."""
+    notes: list[str] = []
+    old_comfy = cfg.get("comfy_dir") or ""
+    comfy = Path(old_comfy) if old_comfy else None
+    if not (comfy and (comfy / "main.py").exists()):
+        cands = [rebase_path(old_comfy)] + [Path(d) for d in detect_comfy_dirs()]
+        for c in cands:
+            if c and (c / "main.py").exists():
+                cfg["comfy_dir"] = str(c)
+                comfy = c
+                notes.append(f"ComfyUI found at {c}")
+                break
+    old_models = cfg.get("models_dir") or ""
+    if not (old_models and Path(old_models).is_dir()):
+        moved = rebase_path(old_models)
+        if moved and moved.is_dir():
+            cfg["models_dir"] = str(moved)
+        elif comfy and (comfy / "models").is_dir():
+            cfg["models_dir"] = str(comfy / "models")
+        if cfg.get("models_dir") != old_models:
+            notes.append(f"Models folder found at {cfg['models_dir']}")
+    py = cfg.get("python") or ""
+    if py and not Path(py).exists():
+        moved = rebase_path(py)
+        cfg["python"] = str(moved) if moved else ""
+        notes.append(f"Python path {py} is gone"
+                     + (f"; using {moved}" if moved else "; cleared"))
+    return notes
+
+
+# folders never worth walking into when hunting for ComfyUI: system trees,
+# package caches, and the inside of a ComfyUI (its models alone can hold
+# thousands of entries)
+_SKIP_DIRS = {"windows", "program files", "program files (x86)", "programdata",
+              "$recycle.bin", "system volume information", "recovery",
+              "node_modules", ".git", "__pycache__", "site-packages", "lib",
+              "libs", "scripts", ".cache", ".venv", "venv", "comfy-venv",
+              "python_embeded", "models", "custom_nodes", "output", "input",
+              "temp", "proc", "sys", "dev", "snap"}
+
+
+def is_comfy_dir(path: Path) -> bool:
+    try:
+        return (path / "main.py").is_file() and \
+            (path / "folder_paths.py").is_file()
+    except OSError:
+        return False
+
+
+def search_roots() -> list[Path]:
+    """Where a full search starts: around the app, home, then every drive."""
+    roots = [APP_DIR.parent.parent, Path.home()]
+    if platform.system() == "Windows":
+        roots += [Path(f"{c}:/") for c in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                  if os.path.exists(f"{c}:/")]
+    else:
+        roots += [Path("/opt"), Path("/srv"), Path("/mnt"), Path("/media")]
+    return roots
+
+
+def find_comfy_installs(roots: list[Path] | None = None, max_depth: int = 6,
+                        budget: float = 45.0) -> list[Path]:
+    """Every ComfyUI under `roots`, shallowest first, within a time budget.
+
+    Breadth-first, so the install a person put somewhere sensible is met
+    long before the walk wanders into deep trees, and a slow or huge drive
+    ends the search on time rather than holding up the engine.
+    """
+    deadline = time.monotonic() + budget
+    found: list[Path] = []
+    seen: set[str] = set()
+    queue = [(r, 0) for r in (roots if roots is not None else search_roots())]
+    while queue and time.monotonic() < deadline:
+        path, depth = queue.pop(0)
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        if is_comfy_dir(path):
+            found.append(path)
+            continue                # nothing worth finding inside one
+        if depth >= max_depth:
+            continue
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    if time.monotonic() >= deadline:
+                        break
+                    try:
+                        if not e.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    if e.name.lower() in _SKIP_DIRS or e.name.startswith("."):
+                        continue
+                    queue.append((Path(e.path), depth + 1))
+        except OSError:
+            continue
+    return found
+
+
+def pick_comfy(installs: list[Path], cfg: dict) -> Path | None:
+    """The install to use: the one holding the Ideogram 4 weights, then the
+    one inside this app, then the first found."""
+    def score(c: Path) -> tuple:
+        models = c / "models"
+        weights = models.is_dir() and not missing_models(models, cfg)
+        try:
+            inside = c.resolve().is_relative_to(APP_DIR.parent.resolve())
+        except (OSError, ValueError):
+            inside = False
+        return (not weights, not inside)
+    return min(installs, key=score) if installs else None
+
+
+def verify_locations(cfg: dict, search: bool = True,
+                     log=None) -> list[str]:
+    """Check every saved location at start; repair what moved.
+
+    The quick repair (heal_paths) handles a moved app folder. When ComfyUI is
+    still nowhere, and `search` is on, the drives are searched for it.
+    """
+    say = log or (lambda _m: None)
+    notes = heal_paths(cfg)
+    comfy = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else None
+    if comfy and (comfy / "main.py").exists():
+        return notes
+    if not search:
+        return notes
+    say("Searching this computer for ComfyUI…")
+    hit = pick_comfy(find_comfy_installs(), cfg)
+    if not hit:
+        say("No ComfyUI found on this computer — install it from the "
+            "Engine page, or set its folder in Settings.")
+        return notes
+    cfg["comfy_dir"] = str(hit)
+    notes.append(f"ComfyUI found at {hit}")
+    models = cfg.get("models_dir") or ""
+    if not (models and Path(models).is_dir()) and (hit / "models").is_dir():
+        cfg["models_dir"] = str(hit / "models")
+        notes.append(f"Models folder found at {cfg['models_dir']}")
+    return notes
+
+
+def location_report(cfg: dict) -> list[str]:
+    """One line per saved location, saying whether it checks out."""
+    out = []
+    comfy = cfg.get("comfy_dir") or ""
+    out.append(f"ComfyUI: {comfy} — ok" if comfy and Path(comfy, "main.py").exists()
+               else "ComfyUI: not found")
+    models = cfg.get("models_dir") or ""
+    if models and Path(models).is_dir():
+        gone = missing_models(Path(models), cfg)
+        out.append(f"Models: {models} — "
+                   + ("all Ideogram 4 weights present" if not gone else
+                      f"{len(gone)} Ideogram 4 file(s) missing"))
+    else:
+        out.append("Models: not found")
     return out
 
 

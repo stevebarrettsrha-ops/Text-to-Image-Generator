@@ -1588,6 +1588,8 @@ async function loadDeps() {
       box.appendChild(el);
     });
     setEngineTag("deps", bad > 0);
+    // the server is searching the drives for ComfyUI: look again shortly
+    if (d.searching) setTimeout(loadDeps, 3000);
   } catch (e) {
     box.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
   }
