@@ -193,8 +193,10 @@ def run(slow: bool = False) -> Suite:
             p.write_bytes(b"")
         s.equal("the install holding the Ideogram 4 weights is the one chosen",
                 bootstrap.pick_comfy(found, wcfg), rich)
+        # a real ~/ComfyUI on this machine must not answer for the search
         with patch.object(bootstrap, "find_comfy_installs",
-                          lambda: [bare, rich]):
+                          lambda: [bare, rich]), \
+                patch.object(bootstrap, "detect_comfy_dirs", lambda: []):
             lost = dict(bootstrap.DEFAULT_CONFIG, comfy_dir=str(root / "gone"))
             bootstrap.verify_locations(lost)
             s.equal("a lost ComfyUI is found by the search",
