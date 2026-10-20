@@ -1195,13 +1195,29 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                 prog.log(f"Portable ComfyUI detected — installing into {target}")
             else:
                 vpy = venv_python(Path(cfg["comfy_dir"]))
+                # A venv with no pip is a failed first attempt (no python3-venv
+                # on Debian/Ubuntu writes the interpreter, then stops).
+                # Installing into it fails the same way every time, so build
+                # it again instead.
+                if vpy.exists() and _run([str(vpy), "-m", "pip",
+                                         "--version"]).returncode != 0:
+                    prog.log("The engine's Python environment is incomplete "
+                             "(no pip) — building it again.")
+                    shutil.rmtree(Path(cfg["comfy_dir"]).parent / "comfy-venv",
+                                  ignore_errors=True)
                 if not vpy.exists():
                     prog.detail("deps", "Creating the Python environment…")
                     res = _run([py, "-m", "venv",
                                 str(Path(cfg["comfy_dir"]).parent / "comfy-venv")])
                     if res.returncode != 0:
+                        shutil.rmtree(Path(cfg["comfy_dir"]).parent / "comfy-venv",
+                                      ignore_errors=True)
                         raise RuntimeError("venv creation failed: " +
-                                           (res.stderr or res.stdout)[-600:])
+                                           (res.stderr or res.stdout)[-600:] +
+                                           (" On Debian/Ubuntu install python3-venv"
+                                            " (sudo apt-get install -y python3-venv),"
+                                            " then run setup again."
+                                            if platform.system() == "Linux" else ""))
                 target = vpy
                 prog.track("deps", None, "Updating pip…")
                 pip_install(str(target), ["--upgrade", "pip", "wheel"],
