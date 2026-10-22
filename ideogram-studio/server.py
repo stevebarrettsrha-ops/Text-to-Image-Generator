@@ -586,12 +586,22 @@ def api_comfy_start():
                             "Python that ComfyUI runs on, so it will not start "
                             "it. Start ComfyUI yourself, then press "
                             "Recheck."}), 400
-        return jsonify({"error": "Run setup first."}), 400
+        return jsonify({"error": _setup_needed()}), 400
     _note("Starting ComfyUI…")
     comfy_proc.start(py, Path(cfg["comfy_dir"]),
                      int(cfg["comfy_url"].rsplit(":", 1)[-1]), progress)
     _refresh_schema_when_up()
     return jsonify({"ok": True})
+
+
+def _setup_needed() -> str:
+    """Why the engine cannot be started, in terms of what fixes it."""
+    comfy = cfg.get("comfy_dir") or ""
+    if comfy and (Path(comfy) / "main.py").exists():
+        return ("ComfyUI has no Python environment on this system yet. "
+                "Press Install beside PyTorch on the Engine page, then "
+                "start the engine.")
+    return "Run setup first."
 
 
 @app.post("/api/comfy/restart")
@@ -613,7 +623,7 @@ def api_comfy_restart():
 
     if comfy_proc.alive():
         if not can_start:
-            return jsonify({"error": "Run setup first."}), 400
+            return jsonify({"error": _setup_needed()}), 400
         _note("Restarting the managed engine…")
         comfy_proc.stop()
         comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
@@ -622,7 +632,7 @@ def api_comfy_restart():
 
     if not comfy_online(url):
         if not can_start:
-            return jsonify({"error": "Run setup first."}), 400
+            return jsonify({"error": _setup_needed()}), 400
         _note("Starting ComfyUI…")
         comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
         _refresh_schema_when_up()

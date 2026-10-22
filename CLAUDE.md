@@ -198,6 +198,18 @@ install holding the Ideogram 4 weights. While it walks, `/api/deps` reports
 `searching` and the page re-polls. `IDEOGRAM_STUDIO_NO_SEARCH=1` (set by the
 test harness) turns it off: test configs name made-up folders on purpose.
 
+A saved path can also be *there* and still wrong: an app folder on a drive
+shared by Windows and Linux carries the Windows `comfy-venv/Scripts/python.exe`
+(or a portable build's `python_embeded/python.exe`), and every run of it is
+`[Errno 8] Exec format error`. `foreign_binary()` reads the first bytes (MZ,
+ELF, Mach-O); `heal_paths()` clears a foreign interpreter, and
+`comfy_python()` / `portable_python()` pass over one. The foreign venv is never
+rebuilt in place — that would break it for the other system — so `venv_dir()`
+gives this one `comfy-venv-linux` (or `-windows`, `-darwin`) beside it, and
+`run.sh` does the same for a Windows `.venv` (`.venv-linux`). Setup never puts
+the interpreter that *builds* the venv (often the app's own, torch-less) into
+`cfg["python"]`: a setup that stops early must not leave the engine on it.
+
 ## Validation gate — run after any edit
 
 ```bash

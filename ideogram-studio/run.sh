@@ -53,16 +53,24 @@ fi
 # pip into the system Python (PEP 668). A venv without pip is rebuilt: without
 # python3-venv, `venv` dies after writing bin/python but before pip, and that
 # half-built folder must not be kept.
-if ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
-  rm -rf .venv
-  "$PY" -m venv .venv || {
-    rm -rf .venv
+# A folder first set up on Windows (a drive both systems share) can carry a
+# Windows .venv — Scripts/python.exe and no bin/python. It can never run
+# here, and rebuilding over it would break it for Windows, so this system
+# gets its own beside it.
+VENV=.venv
+if [ -e .venv/Scripts/python.exe ] && [ ! -e .venv/bin/python ]; then
+  VENV=".venv-$(uname -s | tr '[:upper:]' '[:lower:]')"
+fi
+if ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  rm -rf "$VENV"
+  "$PY" -m venv "$VENV" || {
+    rm -rf "$VENV"
     echo "Could not create a virtual environment. On Debian/Ubuntu install" >&2
     echo "python3-venv (sudo apt-get install -y python3-venv), then run this again." >&2
     exit 1
   }
 fi
-PY=.venv/bin/python
+PY="$VENV/bin/python"
 echo "  Using: $($PY -c 'import sys;print(sys.executable)')"
 "$PY" -m pip install --disable-pip-version-check --quiet -r requirements.txt
 # The server takes this script's place (exec), so whatever stops the
