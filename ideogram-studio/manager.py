@@ -10,6 +10,7 @@ folder, resume, cancel, delete. Repo, token and mirror all come from the page.
 
 from __future__ import annotations
 
+import os
 import platform
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ from pathlib import Path
 import bootstrap
 from bootstrap import (APP_DIR, CUSTOM_NODES, MODEL_REPO, PRECISIONS, VAE_FILE,
                        comfy_python, have_git, model_path, model_set,
-                       portable_python, venv_python)
+                       portable_python, venv_dir, venv_python)
 
 DEFAULT_ENDPOINT = bootstrap.HF_BASE
 MODEL_FOLDERS = ["diffusion_models", "text_encoders", "vae", "checkpoints",
@@ -250,6 +251,30 @@ def dependencies(cfg: dict, client=None, starting: bool = False,
                 items.append({"id": "torch", "label": "PyTorch",
                               "state": "unknown", "detail": out[-140:],
                               "action": "install"})
+    elif comfy_dir and (comfy_dir / "main.py").exists() and (
+            cfg.get("managed", True)
+            or bootstrap.foreign_portable(comfy_dir)
+            or venv_dir(comfy_dir).name != "comfy-venv"):
+        # ComfyUI is here and nothing can run it: "missing", which Install
+        # everything missing acts on. Say why when the folder was set up on
+        # another operating system — its interpreter is on disk, and the raw
+        # answer from running it would be [Errno 8] Exec format error. (An
+        # existing ComfyUI of someone else's whose Python is simply unknown
+        # keeps the old row: building an environment for it is not ours to
+        # start unasked.)
+        detail = "No Python environment for ComfyUI yet."
+        foreign = bootstrap.foreign_portable(comfy_dir)
+        vdir = venv_dir(comfy_dir)
+        if foreign:
+            detail = (f"{foreign} was built for another operating system and "
+                      f"cannot run here. Install builds {vdir.name} for this "
+                      "one and leaves the portable build as it is.")
+        elif vdir.name != "comfy-venv":
+            detail = ("comfy-venv was set up on another operating system and "
+                      f"cannot run here. Install builds {vdir.name} for this "
+                      "one and leaves comfy-venv as it is.")
+        items.append({"id": "torch", "label": "PyTorch", "state": "missing",
+                      "detail": detail, "action": "install"})
     else:
         items.append({"id": "torch", "label": "PyTorch", "state": "unknown",
                       "detail": "Install ComfyUI first.", "action": "install"})
@@ -328,10 +353,40 @@ def _install_git(task: Task) -> None:
     if not cmd or not shutil.which(cmd[0]):
         raise RuntimeError("Git has to be installed by hand on this system. "
                            "Install it, then press Recheck.")
+    cmd = _elevate(cmd, task)
     if stream(cmd, task) != 0:
-        raise RuntimeError("The Git installer did not finish.")
+        by_hand = " ".join(c for c in cmd if c not in ("-n", "pkexec"))
+        if cmd[0] == "pkexec":
+            by_hand = "sudo " + by_hand
+        raise RuntimeError("The Git installer did not finish. Install it by "
+                           f"hand ({by_hand}), then press Recheck.")
     task.set(detail="Git installed. Restart Ideogram Studio if it still shows "
                     "as missing.")
+
+
+def _elevate(cmd: list[str], task: Task) -> list[str]:
+    """A `sudo` command, made runnable from a task with no terminal.
+
+    Plain sudo asks for the password on the terminal the server was started
+    from — on a desktop, usually none anyone is looking at — so the install
+    sat there for ever. When sudo needs no password it runs as `sudo -n`; on
+    a desktop where it does, pkexec asks in a window of its own; elsewhere
+    `sudo -n` fails at once and the error names the command to run by hand.
+    """
+    if cmd[:1] != ["sudo"]:
+        return cmd
+    rest = cmd[2:] if cmd[1:2] == ["-n"] else cmd[1:]
+    try:
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True,
+                          timeout=10).returncode == 0:
+            return ["sudo", "-n"] + rest
+    except Exception:  # noqa: BLE001 - no sudo at all: try pkexec
+        pass
+    desktop = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    if desktop and shutil.which("pkexec"):
+        task.log("Asking for your password in a system window…")
+        return ["pkexec"] + rest
+    return ["sudo", "-n"] + rest
 
 
 def _install_comfyui(task: Task, cfg: dict) -> None:
@@ -394,11 +449,19 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     else:
         vpy = venv_python(comfy_dir)
         if not vpy.exists():
+            vdir = venv_dir(comfy_dir)
             task.set(detail="Creating the Python environment…")
+            if vdir.name != "comfy-venv":
+                task.log(f"comfy-venv was built on another operating system, "
+                         f"so it is left as it is and this one gets "
+                         f"{vdir.name}.")
             base = bootstrap.find_python()
-            if stream([base, "-m", "venv", str(comfy_dir.parent / "comfy-venv")],
-                      task) != 0:
-                raise RuntimeError("Could not create the environment.")
+            if stream([base, "-m", "venv", str(vdir)], task) != 0:
+                raise RuntimeError(
+                    "Could not create the environment."
+                    + (" On Ubuntu install python3-venv (sudo apt-get install "
+                       "-y python3-venv), then press Install again."
+                       if platform.system() == "Linux" else ""))
         target = vpy
     cfg["python"] = str(target)
     if opts.get("torch_index") is not None:

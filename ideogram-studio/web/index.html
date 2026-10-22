@@ -1650,6 +1650,16 @@ async function installAllMissing() {
       S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
       pollTasks();
       var ok = await waitForTask(r.task.id);
+      // Git only fetches ComfyUI and the nodes; with ComfyUI already here, a
+      // Git that would not install must not hold back PyTorch. The nodes
+      // need Git, so they wait for it. (Git is first, so i still points at it.)
+      if (!ok && missing[i] === "git" && missing.indexOf("comfyui") < 0) {
+        missing = missing.filter(function (id) { return id.indexOf("node:") !== 0; });
+        toast("Git did not install — carrying on with PyTorch; the nodes "
+              + "need Git, see the log.", true);
+        await loadDeps();
+        continue;
+      }
       if (!ok) { toast("Stopped at " + missing[i] + " — see the log.", true); return; }
       await loadDeps();
     }
